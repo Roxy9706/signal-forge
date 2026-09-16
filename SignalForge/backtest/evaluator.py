@@ -73,6 +73,11 @@ class Signal:
     score: float  # 0-100
     timeframe: str  # e.g. "1h", "4h", "1d"
     horizon_ms: int  # evaluation horizon in ms (e.g. 4h = 4*3600*1000)
+    # D4 ATR-spike metadata (pure metadata, zero effect on scoring/direction/NO_TRADE/entry/SL/TP/R:R).
+    atr_spike_5m: Optional[bool] = None
+    atr_now_5m: Optional[float] = None
+    atr_sma20_5m: Optional[float] = None
+    atr_spike_ratio_5m: Optional[float] = None
 
 
 @dataclass(frozen=True)
