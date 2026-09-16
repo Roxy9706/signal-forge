@@ -1,1 +1,880 @@
-# CLI; polling interval; batch; output format with chart URL
+# P5 Paper Observer — forward paper-trading / live-market observation
+#
+# Observation-only mode. NO orders, NO API keys, NO private endpoints,
+# NO leverage, NO Telegram/webhooks, NO auto-trading.
+#
+# Architecture:
+#   Binance public klines → closed-candle filter → MTF alignment → scanner
+#   → paper signal → JSONL log (source of truth) → paper evaluator (P3)
+#   → outcome event → JSONL log → CLI/summary
+#
+# Closure rule: candle.close_time <= poll_time (NEVER open_time).
+# MTF alignment: latest_closed_candle[tf] = max(candle where close_time <= T).
+# Signal time: close_time of setup candle (5m if 5m-triggered).
+# Expiration: ONLY when eligible candles exist with close_time >= T + horizon
+#             AND no TP/SL hit. NOT when data is insufficient.
+# State: JSONL is authoritative. State cache is disposable/rebuildable.
+# State keying: per (symbol, timeframe), NOT global timestamp.
+
+
+from __future__ import annotations
+import time
+import sys
+import json
+import hashlib
+import argparse
+from typing import Any, Dict, List, Optional, Tuple, Iterable
+from dataclasses import dataclass, field
+from pathlib import Path
+
+# Local imports
+from binance.market_data import (
+    BinancePublicClient,
+    Kline,
+    get_latest_closed_per_timeframe,
+    get_latest_closed_kline,
+    is_data_stale,
+    DEFAULT_POLL_INTERVAL_SEC,
+    DEFAULT_CANDLE_BUFFER_SEC,
+    MAX_SYMBOLS,
+    MAX_OPEN_SIGNALS,
+)
+from binance.contracts import build_symbol_universe, is_valid_symbol
+from storage.jsonl import (
+    jsonl_append,
+    jsonl_read,
+    jsonl_read_reverse,
+    jsonl_find,
+    jsonl_has_signal,
+    jsonl_has_outcome,
+    jsonl_recover_open_signals,
+    jsonl_get_open_signal_ids,
+    jsonl_get_all_signal_ids,
+    jsonl_get_latest_processed_close_time,
+    jsonl_count,
+)
+from SignalForge.backtest.evaluator import (
+    Candle,
+    Signal,
+    EvaluationResult,
+    evaluate_signal,
+)
+from SignalForge.paper.models import (
+    PaperSignalEvent,
+    PaperOutcomeEvent,
+    DataQualityEvent,
+    make_signal_id,
+    make_strategy_version,
+)
+
+
+# ---------------------------------------------------------------------------
+# P5 Configuration
+# ---------------------------------------------------------------------------
+
+@dataclass
+class P5Config:
+    """P5 paper observation configuration."""
+    # Symbol universe
+    symbols: List[str] = field(default_factory=lambda: ["BTCUSDT", "ETHUSDT"])
+    max_symbols: int = MAX_SYMBOLS
+
+    # Polling
+    poll_interval_sec: int = DEFAULT_POLL_INTERVAL_SEC  # 5 minutes default
+    candle_buffer_sec: int = DEFAULT_CANDLE_BUFFER_SEC  # 1 minute
+
+    # Binance client
+    timeout_sec: int = 10
+    max_retries: int = 5
+    backoff_base_sec: int = 2
+
+    # Strategy
+    strategy_version: str = ""
+    horizon_ms: int = 4 * 3600 * 1000  # 4 hours
+
+    # Fee/slippage (for P3 evaluator, net R calculation only)
+    fee_pct: float = 0.001
+    slippage_pct: float = 0.001
+
+    # Logging
+    log_path: str = "data/signals/paper_trade.jsonl"
+
+    # Safety
+    max_open_signals: int = MAX_OPEN_SIGNALS
+
+    # Stale data
+    stale_max_age_ms: int = 2 * 300 * 1000  # 2 x 5m candles
+
+
+# ---------------------------------------------------------------------------
+# Paper scanner — generates signals from closed candles
+# ---------------------------------------------------------------------------
+
+class PaperScanner:
+    """
+    Scans closed Binance klines and generates paper signals.
+
+    Uses the existing P1 strategy (frozen) to score symbols.
+    Generates a signal when the score crosses the threshold (deterministic).
+
+    Closure rule: candle.close_time <= poll_time (NEVER open_time).
+    MTF alignment: latest_closed_candle[tf] = max(candle where close_time <= T).
+    Signal time: close_time of setup candle (5m if 5m-triggered).
+    """
+
+    def __init__(self, config: P5Config):
+        self.config = config
+        # We don't implement a real scoring engine here — that's P1 territory.
+        # For P5 observation, we demonstrate the pipeline with a simplified
+        # scoring placeholder that can be replaced with the real P1 scanner.
+        # The key P5 requirement is the closed-candle / MTF / signal-lifecycle
+        # plumbing, NOT a new scoring algorithm.
+
+    def generate_signals(
+        self,
+        symbol: str,
+        klines_5m: List[Kline],
+        klines_15m: List[Kline],
+        klines_1h: List[Kline],
+        klines_4h: List[Kline],
+        klines_1d: List[Kline],
+        poll_time_ms: int,
+        existing_signal_ids: set,
+    ) -> List[PaperSignalEvent]:
+        """
+        Scan the latest closed candles for a symbol and generate signals.
+
+        Args:
+            symbol: trading symbol (e.g. "BTCUSDT")
+            klines_*: lists of Kline objects for each timeframe (raw from API)
+            poll_time_ms: current poll time in ms
+            existing_signal_ids: set of signal_ids already in the JSONL log
+
+        Returns:
+            List of PaperSignalEvent to be written to JSONL.
+        """
+        # Filter to closed candles only (close_time <= poll_time - buffer)
+        buffer_ms = self.config.candle_buffer_sec * 1000
+        cutoff = poll_time_ms - buffer_ms
+
+        closed_5m = [k for k in klines_5m if k.close_time <= cutoff]
+        closed_15m = [k for k in klines_15m if k.close_time <= cutoff]
+        closed_1h = [k for k in klines_1h if k.close_time <= cutoff]
+        closed_4h = [k for k in klines_4h if k.close_time <= cutoff]
+        closed_1d = [k for k in klines_1d if k.close_time <= cutoff]
+
+        if not closed_5m:
+            return []
+
+        # Latest closed 5m candle is the potential setup candle
+        latest_5m = max(closed_5m, key=lambda k: k.close_time)
+
+        # MTF alignment: for each higher TF, find latest closed candle
+        # with close_time <= latest_5m.close_time (the signal time T)
+        T = latest_5m.close_time
+
+        mtf = get_latest_closed_per_timeframe(
+            {
+                "5m": closed_5m,
+                "15m": closed_15m,
+                "1h": closed_1h,
+                "4h": closed_4h,
+                "1d": closed_1d,
+            },
+            T,
+        )
+
+        # Check if we already have a signal for this (symbol, T)
+        candidate_id = make_signal_id(symbol, "LONG", T)
+        if candidate_id in existing_signal_ids:
+            return []  # duplicate
+
+        # Placeholder scoring — in production this would use the real P1 scanner.
+        # For P5 observation, we generate a signal if the latest closed candle
+        # has a close > open (up candle) OR close < open (down candle).
+        # This is a DEMONSTRATION scanner, not a real strategy.
+        #
+        # IMPORTANT: The real P1 strategy (40/20/20/20 weights) is frozen.
+        # This placeholder MUST NOT be treated as the actual strategy.
+        # In production, replace this with the real scanner.module.
+
+        score = 0.0
+        direction = "NO_TRADE"
+
+        # Simplified placeholder: use 5m candle direction as a proxy
+        if latest_5m.close > latest_5m.open:
+            direction = "LONG"
+            score = 55.0  # placeholder score
+        elif latest_5m.close < latest_5m.open:
+            direction = "SHORT"
+            score = 55.0  # placeholder score
+
+        # Only generate if score >= 50 (arbitrary threshold for demo)
+        if direction == "NO_TRADE" or score < 50.0:
+            return []
+
+        # Generate signal
+        sl_distance = abs(latest_5m.close * 0.02)  # 2% SL (placeholder)
+        tp_distance = abs(latest_5m.close * 0.04)  # 4% TP (placeholder, 2:1 R:R)
+
+        if direction == "LONG":
+            entry = latest_5m.close
+            sl = entry - sl_distance
+            tp = entry + tp_distance
+        else:
+            entry = latest_5m.close
+            sl = entry + sl_distance
+            tp = entry - tp_distance
+
+        signal_id = make_signal_id(symbol, direction, T)
+
+        event = PaperSignalEvent(
+            event="signal",
+            signal_id=signal_id,
+            symbol=symbol,
+            direction=direction,
+            signal_time=T,
+            entry=entry,
+            tp=tp,
+            sl=sl,
+            score=score,
+            timeframe="5m",
+            horizon_ms=self.config.horizon_ms,
+            strategy_version=self.config.strategy_version,
+            generated_at=poll_time_ms,
+        )
+
+        return [event]
+
+
+# ---------------------------------------------------------------------------
+# Paper evaluator — evaluates open signals against new closed candles
+# ---------------------------------------------------------------------------
+
+class PaperEvaluator:
+    """
+    Evaluates open paper signals against newly available closed candles.
+
+    Uses the P3 evaluator (real, tested) for TP/SL/expiration logic.
+    Wraps the result into paper outcome events for JSONL logging.
+
+    Expiration rule: ONLY when eligible candles exist with close_time >= T + horizon
+                     AND no TP/SL hit. NOT when data is insufficient.
+    """
+
+    def __init__(self, config: P5Config):
+        self.config = config
+
+    def evaluate_open_signals(
+        self,
+        open_signals: List[PaperSignalEvent],
+        new_candles_5m: List[Candle],
+        current_poll_time_ms: int,
+    ) -> List[PaperOutcomeEvent]:
+        """
+        Evaluate all open signals against new 5m candles.
+
+        Args:
+            open_signals: list of unresolved paper signals from JSONL
+            new_candles_5m: list of NEW closed 5m candles since last eval
+            current_poll_time_ms: current poll time (for expiration check)
+
+        Returns:
+            List of PaperOutcomeEvent for signals that resolved.
+        """
+        outcomes: List[PaperOutcomeEvent] = []
+
+        for sig_event in open_signals:
+            # Reconstruct a P3 Signal from the paper event
+            signal = Signal(
+                signal_id=sig_event.signal_id,
+                symbol=sig_event.symbol,
+                direction=sig_event.direction,
+                timestamp=sig_event.signal_time,
+                entry=sig_event.entry,
+                tp=sig_event.tp,
+                sl=sig_event.sl,
+                score=sig_event.score,
+                timeframe=sig_event.timeframe,
+                horizon_ms=sig_event.horizon_ms,
+            )
+
+            # Determine the horizon end
+            T = sig_event.signal_time
+            horizon_end = T + sig_event.horizon_ms
+
+            # Filter new_candles to those strictly after T and within horizon
+            future_candles = [
+                c for c in new_candles_5m
+                if c.timestamp > T and c.timestamp <= horizon_end
+            ]
+
+            # Check if we have enough data to evaluate expiration:
+            # Expiration ONLY if we have at least one candle with close_time >= horizon_end
+            # OR if new_candles extend past the horizon.
+            has_reach_horizon = any(
+                c.timestamp >= horizon_end for c in new_candles_5m
+            )
+
+            if not future_candles:
+                # No new candles in the evaluation window.
+                # If has_reach_horizon is False, we cannot conclude expiration.
+                # Keep signal OPEN — do NOT mark as expired.
+                continue
+
+            # Evaluate using P3 evaluator
+            result = evaluate_signal(
+                signal,
+                future_candles,
+                fee_pct=self.config.fee_pct,
+                slippage_pct=self.config.slippage_pct,
+            )
+
+            # Determine close_time for the outcome event
+            if result.touch_timestamp is not None:
+                outcome_close_time = result.touch_timestamp
+            elif result.outcome == "EXPIRATION":
+                # For expiration, use the horizon_end as the close_time
+                # (this is when the signal definitively expired)
+                outcome_close_time = horizon_end
+            else:
+                outcome_close_time = current_poll_time_ms
+
+            # Build outcome event
+            outcome_event = PaperOutcomeEvent(
+                event={
+                    "TP": "tp_hit",
+                    "SL": "sl_hit",
+                    "EXPIRATION": "expired",
+                }.get(result.outcome, "expired"),
+                signal_id=result.signal_id,
+                symbol=result.symbol,
+                direction=result.direction,
+                outcome={
+                    "TP": "tp_hit",
+                    "SL": "sl_hit",
+                    "EXPIRATION": "expired",
+                }.get(result.outcome, "expired"),
+                outcome_time=result.touch_timestamp if result.touch_timestamp is not None else horizon_end,
+                entry=signal.entry,
+                tp=signal.tp,
+                sl=signal.sl,
+                gross_r=result.gross_r if result.gross_r is not None else 0.0,
+                net_r=result.net_r if result.net_r is not None else 0.0,
+                holding_ms=result.holding_ms if result.holding_ms is not None else 0,
+                fee=result.fee,
+                slippage=result.slippage,
+                horizon_ms=signal.horizon_ms,
+                strategy_version=self.config.strategy_version,
+                close_time=outcome_close_time,
+            )
+
+            outcomes.append(outcome_event)
+
+        return outcomes
+
+
+# ---------------------------------------------------------------------------
+# Paper observer — main loop
+# ---------------------------------------------------------------------------
+
+class PaperObserver:
+    """
+    Main paper observation loop.
+
+    Coordinates: kline fetching, signal generation, evaluation, JSONL logging.
+    JSONL is the source of truth. State cache is optional/disposable.
+    """
+
+    def __init__(self, config: P5Config):
+        self.config = config
+        self.client = BinancePublicClient(
+            timeout_sec=config.timeout_sec,
+            max_retries=config.max_retries,
+            backoff_base_sec=config.backoff_base_sec,
+        )
+        self.scanner = PaperScanner(config)
+        self.evaluator = PaperEvaluator(config)
+        self.log_path = config.log_path
+
+        # Ensure log directory exists
+        Path(self.log_path).parent.mkdir(parents=True, exist_ok=True)
+
+    def get_existing_signal_ids(self) -> set:
+        """Get set of all signal_ids already in the JSONL log."""
+        return set(jsonl_get_all_signal_ids(self.log_path))
+
+    def get_open_signal_events(self) -> List[PaperSignalEvent]:
+        """Recover open (unresolved) signal events from JSONL."""
+        open_sigs = jsonl_recover_open_signals(self.log_path)
+        events: List[PaperSignalEvent] = []
+        for d in open_sigs:
+            events.append(PaperSignalEvent(
+                event=d.get("event", "signal"),
+                signal_id=d.get("signal_id", ""),
+                symbol=d.get("symbol", ""),
+                direction=d.get("direction", ""),
+                signal_time=d.get("signal_time", 0),
+                entry=d.get("entry", 0.0),
+                tp=d.get("tp", 0.0),
+                sl=d.get("sl", 0.0),
+                score=d.get("score", 0.0),
+                timeframe=d.get("timeframe", "5m"),
+                horizon_ms=d.get("horizon_ms", 4 * 3600 * 1000),
+                strategy_version=d.get("strategy_version", ""),
+                generated_at=d.get("generated_at", 0),
+            ))
+        return events
+
+    def poll_symbol(
+        self,
+        symbol: str,
+    ) -> Tuple[
+        List[Kline],  # 5m
+        List[Kline],  # 15m
+        List[Kline],  # 1h
+        List[Kline],  # 4h
+        List[Kline],  # 1d
+        int,  # poll_time_ms
+        Optional[str],  # error_type
+    ]:
+        """
+        Fetch klines for a single symbol across all 5 timeframes.
+
+        Returns:
+            Tuple of (klines_5m, klines_15m, klines_1h, klines_4h, klines_1d,
+                     poll_time_ms, error_type or None)
+        """
+        poll_time_ms = int(time.time() * 1000)
+
+        intervals = ["5m", "15m", "1h", "4h", "1d"]
+        all_klines: Dict[str, List[Kline]] = {}
+
+        for interval in intervals:
+            try:
+                klines = self.client.get_klines(
+                    symbol=symbol,
+                    interval=interval,
+                    limit=1000,
+                )
+                all_klines[interval] = klines
+            except Exception as e:
+                error_type = self._classify_error(e)
+                # Return empty lists for this symbol on error
+                return (
+                    [],
+                    [],
+                    [],
+                    [],
+                    [],
+                    poll_time_ms,
+                    error_type,
+                )
+
+        return (
+            all_klines["5m"],
+            all_klines["15m"],
+            all_klines["1h"],
+            all_klines["4h"],
+            all_klines["1d"],
+            poll_time_ms,
+            None,
+        )
+
+    def _classify_error(self, exc: Exception) -> str:
+        """Classify an exception into an error type for data_quality events."""
+        msg = str(exc).lower()
+        if "429" in msg:
+            return "rate_limit"
+        if "5" in msg and "http" in msg:
+            return "server_error"
+        if "timeout" in msg or "timed out" in msg:
+            return "network_error"
+        if "url" in msg or "connection" in msg:
+            return "network_error"
+        if "malformed" in msg or "json" in msg:
+            return "malformed"
+        return "unknown"
+
+    def run_once(self) -> Dict[str, Any]:
+        """
+        Run one poll cycle for all configured symbols.
+
+        Returns a summary dict for logging/monitoring.
+        """
+        poll_time_ms = int(time.time() * 1000)
+        summary = {
+            "poll_time_ms": poll_time_ms,
+            "symbols_processed": 0,
+            "signals_generated": 0,
+            "outcomes_resolved": 0,
+            "errors": {},
+            "data_quality_events": 0,
+        }
+
+        all_signal_ids = jsonl_get_all_signal_ids(self.log_path)
+        existing_ids = set(all_signal_ids)
+        open_events = self.get_open_signal_events()
+
+        # Check open signal count safety
+        if len(open_events) > self.config.max_open_signals:
+            summary["errors"]["too_many_open"] = f"open signals ({len(open_events)}) exceed max ({self.config.max_open_signals})"
+            return summary
+
+        for symbol in self.config.symbols:
+            summary["symbols_processed"] += 1
+
+            # Fetch klines
+            klines_5m, klines_15m, klines_1h, klines_4h, klines_1d, poll_ts, error = self.poll_symbol(symbol)
+
+            if error:
+                summary["errors"][symbol] = error
+                # Write data_quality event
+                dq_event = DataQualityEvent(
+                    event="data_quality",
+                    symbol=symbol,
+                    interval="5m",
+                    poll_time=poll_ts,
+                    message=f"Fetch error: {error}",
+                    data_available=False,
+                    error_type=error,
+                )
+                jsonl_append(self.log_path, dq_event.to_dict())
+                summary["data_quality_events"] += 1
+                continue
+
+            # Check for stale data
+            latest_5m = get_latest_closed_kline(klines_5m, poll_ts) if klines_5m else None
+            stale_max_age = self.config.stale_max_age_ms
+            if is_data_stale(latest_5m, poll_ts, stale_max_age):
+                dq_event = DataQualityEvent(
+                    event="data_quality",
+                    symbol=symbol,
+                    interval="5m",
+                    poll_time=poll_ts,
+                    message=f"Stale data: latest 5m close_time={latest_5m.close_time if latest_5m else 'N/A'}",
+                    data_available=False,
+                    stale=True,
+                )
+                jsonl_append(self.log_path, dq_event.to_dict())
+                summary["data_quality_events"] += 1
+                continue
+
+            # Generate signals
+            new_signals = self.scanner.generate_signals(
+                symbol=symbol,
+                klines_5m=klines_5m,
+                klines_15m=klines_15m,
+                klines_1h=klines_1h,
+                klines_4h=klines_4h,
+                klines_1d=klines_1d,
+                poll_time_ms=poll_ts,
+                existing_signal_ids=existing_ids,
+            )
+
+            for sig_event in new_signals:
+                jsonl_append(self.log_path, sig_event.to_dict())
+                existing_ids.add(sig_event.signal_id)
+                summary["signals_generated"] += 1
+
+            # Evaluate open signals for this symbol
+            symbol_open = [e for e in open_events if e.symbol == symbol]
+            if symbol_open and klines_5m:
+                # Convert klines to candles for P3 evaluator
+                new_candles = [k.to_candle() for k in klines_5m]
+
+                outcomes = self.evaluator.evaluate_open_signals(
+                    symbol_open,
+                    new_candles,
+                    poll_ts,
+                )
+
+                for outcome in outcomes:
+                    jsonl_append(self.log_path, outcome.to_dict())
+                    summary["outcomes_resolved"] += 1
+
+        return summary
+
+    def run_loop(self, max_cycles: Optional[int] = None) -> None:
+        """
+        Run the paper observation loop.
+
+        Args:
+            max_cycles: optional limit on number of poll cycles (None = infinite)
+        """
+        cycle = 0
+        try:
+            while max_cycles is None or cycle < max_cycles:
+                cycle += 1
+                summary = self.run_once()
+                print(f"[P5] Cycle {cycle}: {json.dumps(summary, default=str)}")
+                if max_cycles is None or cycle < max_cycles:
+                    time.sleep(self.config.poll_interval_sec)
+        except KeyboardInterrupt:
+            print("[P5] Interrupted by user.")
+        except Exception as e:
+            print(f"[P5] Fatal error: {e}", file=sys.stderr)
+            raise
+
+
+# ---------------------------------------------------------------------------
+# P5 CLI
+# ---------------------------------------------------------------------------
+
+def build_parser() -> argparse.ArgumentParser:
+    """Build the P5 CLI argument parser."""
+    parser = argparse.ArgumentParser(
+        description="SignalForge P5 — Paper Trading Observation (read-only)",
+        prog="scanner.py",
+    )
+    subparsers = parser.add_subparsers(dest="command", help="P5 commands")
+
+    # --mode paper (default observation mode)
+    paper_parser = subparsers.add_parser("paper", help="Run paper observation loop")
+    paper_parser.add_argument(
+        "--symbols",
+        nargs="+",
+        default=["BTCUSDT", "ETHUSDT"],
+        help="Symbols to observe (default: BTCUSDT ETHUSDT)",
+    )
+    paper_parser.add_argument(
+        "--interval",
+        type=int,
+        default=DEFAULT_POLL_INTERVAL_SEC,
+        help=f"Poll interval in seconds (default: {DEFAULT_POLL_INTERVAL_SEC})",
+    )
+    paper_parser.add_argument(
+        "--max-cycles",
+        type=int,
+        default=None,
+        help="Max poll cycles (default: infinite, Ctrl+C to stop)",
+    )
+    paper_parser.add_argument(
+        "--log",
+        type=str,
+        default="data/signals/paper_trade.jsonl",
+        help="JSONL log path (default: data/signals/paper_trade.jsonl)",
+    )
+
+    # --show-open
+    open_parser = subparsers.add_parser("show-open", help="Show open (unresolved) paper signals")
+    open_parser.add_argument(
+        "--log",
+        type=str,
+        default="data/signals/paper_trade.jsonl",
+        help="JSONL log path",
+    )
+
+    # --show-recent N
+    recent_parser = subparsers.add_parser("show-recent", help="Show recent paper events")
+    recent_parser.add_argument(
+        "n",
+        type=int,
+        default=20,
+        nargs="?",
+        help="Number of recent events to show (default: 20)",
+    )
+    recent_parser.add_argument(
+        "--log",
+        type=str,
+        default="data/signals/paper_trade.jsonl",
+        help="JSONL log path",
+    )
+
+    # --summary --period daily|weekly
+    summary_parser = subparsers.add_parser("summary", help="On-demand daily/weekly summary")
+    summary_parser.add_argument(
+        "--period",
+        choices=["daily", "weekly"],
+        required=True,
+        help="Summary period",
+    )
+    summary_parser.add_argument(
+        "--log",
+        type=str,
+        default="data/signals/paper_trade.jsonl",
+        help="JSONL log path",
+    )
+
+    return parser
+
+
+def cmd_paper(args) -> None:
+    """Run the paper observation loop."""
+    config = P5Config(
+        symbols=args.symbols[:MAX_SYMBOLS],
+        poll_interval_sec=args.interval,
+        log_path=args.log,
+        strategy_version=make_strategy_version(),
+    )
+    observer = PaperObserver(config)
+    print(f"[P5] Starting paper observation: {len(config.symbols)} symbols, "
+          f"interval={args.interval}s, log={args.log}")
+    print("[P5] Mode: PAPER ONLY — NO orders, NO keys, NO private endpoints.")
+    print("[P5] Press Ctrl+C to stop.")
+    observer.run_loop(max_cycles=args.max_cycles)
+
+
+def cmd_show_open(args) -> None:
+    """Show open (unresolved) paper signals."""
+    open_events = jsonl_recover_open_signals(args.log)
+    if not open_events:
+        print("[P5] No open signals.")
+        return
+
+    print(f"[P5] Open signals: {len(open_events)}")
+    print("-" * 60)
+    for evt in open_events:
+        sid = evt.get("signal_id", "?")
+        sym = evt.get("symbol", "?")
+        direction = evt.get("direction", "?")
+        stime = evt.get("signal_time", 0)
+        score = evt.get("score", 0.0)
+        tp = evt.get("tp", 0.0)
+        sl = evt.get("sl", 0.0)
+        print(f"  {sid}  {sym}  {direction}  "
+              f"time={stime}  score={score:.1f}  "
+              f"TP={tp:.2f}  SL={sl:.2f}")
+
+
+def cmd_show_recent(args) -> None:
+    """Show recent paper events."""
+    events = jsonl_read_reverse(args.log, limit=args.n)
+    if not events:
+        print("[P5] No events in log.")
+        return
+
+    print(f"[P5] Recent {len(events)} events:")
+    print("-" * 60)
+    for evt in events:
+        etype = evt.get("event", "?")
+        sid = evt.get("signal_id", "?")
+        sym = evt.get("symbol", "?")
+        if etype == "signal":
+            direction = evt.get("direction", "?")
+            stime = evt.get("signal_time", 0)
+            score = evt.get("score", 0.0)
+            print(f"  [{etype}] {sid}  {sym}  {direction}  "
+                  f"time={stime}  score={score:.1f}")
+        elif etype in ("tp_hit", "sl_hit", "expired"):
+            outcome = evt.get("outcome", etype)
+            gross_r = evt.get("gross_r", 0.0)
+            net_r = evt.get("net_r", 0.0)
+            hold = evt.get("holding_ms", 0)
+            print(f"  [{etype}] {sid}  {sym}  {outcome}  "
+                  f"R={gross_r:.2f}  netR={net_r:.2f}  hold={hold}ms")
+        elif etype == "data_quality":
+            msg = evt.get("message", "?")
+            print(f"  [data_quality] {sym}: {msg}")
+        else:
+            print(f"  [{etype}] {sid}  {sym}")
+
+
+def cmd_summary(args) -> None:
+    """On-demand daily/weekly summary from JSONL log."""
+    events = jsonl_read(args.log)
+    if not events:
+        print("[P5] No events in log. No summary available.")
+        return
+
+    # Filter to signal and outcome events
+    signals = [e for e in events if e.get("event") == "signal"]
+    outcomes = [e for e in events if e.get("event") in ("tp_hit", "sl_hit", "expired")]
+
+    # Count by outcome type
+    tp_count = sum(1 for o in outcomes if o.get("outcome") == "tp_hit")
+    sl_count = sum(1 for o in outcomes if o.get("outcome") == "sl_hit")
+    expired_count = sum(1 for o in outcomes if o.get("outcome") == "expired")
+
+    # Compute gross R from outcomes
+    gross_r_total = sum(o.get("gross_r", 0.0) for o in outcomes)
+    net_r_total = sum(o.get("net_r", 0.0) for o in outcomes)
+
+    # Open signals
+    open_ids = jsonl_get_open_signal_ids(args.log)
+    open_count = len(open_ids)
+
+    # Data quality events
+    dq_events = [e for e in events if e.get("event") == "data_quality"]
+    dq_count = len(dq_events)
+
+    # Unique symbols
+    symbols = sorted(set(e.get("symbol", "?") for e in signals))
+
+    # Time range
+    times = [e.get("signal_time", 0) for e in signals] + \
+            [e.get("outcome_time", 0) for e in outcomes]
+    times = [t for t in times if t > 0]
+    if times:
+        first_time = min(times)
+        last_time = max(times)
+    else:
+        first_time = last_time = 0
+
+    print(f"[P5] {'Daily' if args.period == 'daily' else 'Weekly'} Summary")
+    print("=" * 60)
+    print(f"Period: {args.period}")
+    print(f"Symbols: {', '.join(symbols) if symbols else 'none'}")
+    print(f"Time range: {first_time} — {last_time}")
+    print()
+    print(f"Signals (total):    {len(signals)}")
+    print(f"  Completed:        {len(outcomes)}")
+    print(f"  Open (unresolved): {open_count}")
+    print(f"  Data quality events: {dq_count}")
+    print()
+    print(f"--- Outcomes ---")
+    print(f"TP hits:            {tp_count}")
+    print(f"SL hits:            {sl_count}")
+    print(f"Expired:            {expired_count}")
+    print()
+    print(f"--- R Metrics ---")
+    if len(outcomes) > 0:
+        win_rate = tp_count / (tp_count + sl_count) if (tp_count + sl_count) > 0 else 0.0
+        print(f"Win rate:           {win_rate * 100:.1f}%")
+        print(f"Expectancy (R):     {gross_r_total / len(outcomes):.3f}R")
+        print(f"Cumulative R (gross): {gross_r_total:.3f}R")
+        print(f"Cumulative R (net):   {net_r_total:.3f}R")
+    else:
+        print(f"Win rate:           n/a (no completed signals)")
+        print(f"Expectancy (R):     n/a")
+        print(f"Cumulative R (gross): 0.000R")
+        print(f"Cumulative R (net):   0.000R")
+    print()
+    print(f"--- Sample Size ---")
+    print(f"Completed signals:  {len(outcomes)}")
+    if len(outcomes) < 30:
+        print(f"⚠ INSUFFICIENT SAMPLE: only {len(outcomes)} completed signals (< 30).")
+        print(f"  Results are exploratory, not statistically reliable.")
+    print()
+    print(f"--- Data Quality ---")
+    print(f"Data quality events: {dq_count}")
+    if dq_events:
+        for dq in dq_events[-5:]:
+            print(f"  • {dq.get('message', '?')}")
+    print()
+    print("=" * 60)
+    print("NOTE: P5 forward paper results are SEPARATE from P4 historical backtest.")
+    print("P4 and P5 are NEVER merged. Side-by-side comparison only.")
+    print()
+    print("Forward paper-trading results do not guarantee future real-trading performance.")
+    print("=" * 60)
+
+
+def main() -> None:
+    parser = build_parser()
+    args = parser.parse_args()
+
+    if args.command == "paper":
+        cmd_paper(args)
+    elif args.command == "show-open":
+        cmd_show_open(args)
+    elif args.command == "show-recent":
+        cmd_show_recent(args)
+    elif args.command == "summary":
+        cmd_summary(args)
+    else:
+        parser.print_help()
+
+
+if __name__ == "__main__":
+    main()
