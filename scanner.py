@@ -185,67 +185,33 @@ class PaperScanner:
             T,
         )
 
-        # Check if we already have a signal for this (symbol, T)
-        candidate_id = make_signal_id(symbol, "LONG", T)
+        # Determine direction from strategy.
+        # ---------------------------------------------------------------------------
+        # PLACEHOLDER DISABLED: no real P1 strategy wired yet.
+        # The scanner MUST NOT emit fake strategy signals. Until the frozen P1
+        # strategy (40/20/20/20; 25/25/20/20/10; ATR/RSI/EMA/structure/volume)
+        # is plugged in, produce NO_TRADE so the pipeline stays quiet.
+        # ---------------------------------------------------------------------------
+        direction = "NO_TRADE"  # TODO: replace with real P1 strategy call
+
+        # Early exit: nothing to generate or dedupe for NO_TRADE.
+        # When the real P1 strategy is wired, direction will be LONG or SHORT
+        # and execution continues to the duplicate check below.
+        if direction == "NO_TRADE":
+            return []
+
+        # Duplicate check uses the ACTUAL calculated direction (not hardcoded).
+        # Same (symbol, direction, closed-candle close_time) -> same signal_id
+        # -> rejected. Different timestamp or different direction -> distinct.
+        candidate_id = make_signal_id(symbol, direction, T)
         if candidate_id in existing_signal_ids:
             return []  # duplicate
 
-        # Placeholder scoring — in production this would use the real P1 scanner.
-        # For P5 observation, we generate a signal if the latest closed candle
-        # has a close > open (up candle) OR close < open (down candle).
-        # This is a DEMONSTRATION scanner, not a real strategy.
-        #
-        # IMPORTANT: The real P1 strategy (40/20/20/20 weights) is frozen.
-        # This placeholder MUST NOT be treated as the actual strategy.
-        # In production, replace this with the real scanner.module.
-
-        score = 0.0
-        direction = "NO_TRADE"
-
-        # Simplified placeholder: use 5m candle direction as a proxy
-        if latest_5m.close > latest_5m.open:
-            direction = "LONG"
-            score = 55.0  # placeholder score
-        elif latest_5m.close < latest_5m.open:
-            direction = "SHORT"
-            score = 55.0  # placeholder score
-
-        # Only generate if score >= 50 (arbitrary threshold for demo)
-        if direction == "NO_TRADE" or score < 50.0:
-            return []
-
-        # Generate signal
-        sl_distance = abs(latest_5m.close * 0.02)  # 2% SL (placeholder)
-        tp_distance = abs(latest_5m.close * 0.04)  # 4% TP (placeholder, 2:1 R:R)
-
-        if direction == "LONG":
-            entry = latest_5m.close
-            sl = entry - sl_distance
-            tp = entry + tp_distance
-        else:
-            entry = latest_5m.close
-            sl = entry + sl_distance
-            tp = entry - tp_distance
-
-        signal_id = make_signal_id(symbol, direction, T)
-
-        event = PaperSignalEvent(
-            event="signal",
-            signal_id=signal_id,
-            symbol=symbol,
-            direction=direction,
-            signal_time=T,
-            entry=entry,
-            tp=tp,
-            sl=sl,
-            score=score,
-            timeframe="5m",
-            horizon_ms=self.config.horizon_ms,
-            strategy_version=self.config.strategy_version,
-            generated_at=poll_time_ms,
-        )
-
-        return [event]
+        # Signal construction (entry, SL, TP, score, ATR, RSI, EMA, structure,
+        # volume, R:R) is performed by the real P1 strategy.
+        # Placeholder signal construction removed — no fake signals emitted.
+        # TODO: replace with real P1 strategy signal construction.
+        return []
 
 
 # ---------------------------------------------------------------------------
