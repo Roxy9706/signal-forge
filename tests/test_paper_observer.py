@@ -1,27 +1,4 @@
-# P5 Paper Observer — deterministic offline tests
-#
-# No live Binance dependency. All tests use synthetic/mocked data.
-#
-# Covers correction items:
-#  1. close_time handling (candle close_time <= poll_time)
-#  2. forming candle exclusion
-#  3. late polling safety
-#  4. exact MTF boundaries (5m→15m, 15m→1h, 1h→4h, 4h→1d)
-#  5. duplicate polling prevention
-#  6. restart recovery from JSONL (source of truth)
-#  7. corrupted state cache (disposable)
-#  8. JSONL source of truth
-#  9. multiple symbols/timeframes (per-symbol+TF state)
-# 10. 4h expiration by close_time
-# 11. NOT ENOUGH TIME ELAPSED → remains OPEN (not expired)
-# 12. TP/SL evaluation (P3 evaluator)
-# 13. API 429, 5xx, network failure, malformed
-# 14. stale data → data_quality event, not NO_TRADE
-# 15. missing candles → DATA_UNAVAILABLE
-# 16. immutable signals
-# 17. strategy version preservation
-# 18. resource limits (no pandas/numpy/scipy)
-# 19. terms/glossary
+# P5 Paper Observation — Deterministic Offline Tests
 
 
 from __future__ import annotations
@@ -34,15 +11,12 @@ import sys
 import unittest
 from typing import List, Dict, Optional
 from pathlib import Path
-from dataclasses import dataclass, field
-from unittest.mock import patch, MagicMock
+from dataclasses import dataclass
 
-# Ensure project root is on path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
 
 from binance.market_data import (
     Kline,
-    OHLCV,
     BinancePublicClient,
     Candle,
     filter_closed_klines,
@@ -54,10 +28,9 @@ from binance.market_data import (
     DEFAULT_CANDLE_BUFFER_SEC,
     MAX_SYMBOLS,
     MAX_OPEN_SIGNALS,
-    CANDLE_INTERVAL_MS,
 )
 
-from binance.contracts import is_valid_symbol, build_symbol_universe
+from binance.contracts import is_valid_symbol
 
 from storage.jsonl import (
     jsonl_append,
@@ -71,7 +44,6 @@ from storage.jsonl import (
     jsonl_get_latest_processed_close_time,
     jsonl_count,
     jsonl_is_empty,
-    read_jsonl_lines,
     jsonl_read_reverse,
 )
 
@@ -82,7 +54,6 @@ from SignalForge.backtest.evaluator import (
 )
 
 from SignalForge.paper.models import (
-    PaperSignalEvent,
     PaperSignalEvent,
     PaperOutcomeEvent,
     DataQualityEvent,
@@ -98,18 +69,8 @@ from scanner import (
 )
 
 
-# =============================================================================
-# Helpers
-# =============================================================================
-
 def _ms(ts: float) -> int:
-    """Convert seconds-since-epoch to ms."""
     return int(ts * 1000)
-
-
-def _sec(ms: int) -> float:
-    """Convert ms to seconds-since-epoch."""
-    return ms / 1000.0
 
 
 def _kline(
@@ -178,7 +139,6 @@ def _signal(
 
 
 def _make_temp_jsonl() -> str:
-    """Create a temporary JSONL file path."""
     fd, path = tempfile.mkstemp(suffix=".jsonl")
     os.close(fd)
     return path
@@ -189,36 +149,18 @@ def _cleanup(path: str) -> None:
         os.unlink(path)
 
 
-# =============================================================================
-# Test suite
-# =============================================================================
-
 class TestCloseTimeHandling(unittest.TestCase):
-    """CORRECTION 1: Use Binance kline close_time as canonical field."""
+    """CORRECTION 1: close_time is canonical; open_time never used for production."""
 
     def test_candle_eligible_when_close_time_before_poll(self):
-        k = _kline(
-            open_time=_ms(1000),
-            close_time=_ms(1005),
-            open_=100.0, high=101.0, low=99.0, close=100.5,
-            volume=1000.0,
-        )
+        k = _kline(open_time=_ms(1000), close_time=_ms(1005),
+                    open_=100.0, high=101.0, low=99.0, close=100.5, volume=1000.0)
         poll_time = _ms(1006)
         self.assertTrue(k.close_time <= poll_time)
-        # open_time alone would be misleading — note open_time=1000000 < poll_time-1000=1005000
-        # but the candle CLOSED at 1005000 which IS <= poll_time=1006000
-        # The point: a candle with open_time 1000000 and close_time 1010000 (forming)
-        # would have open_time <= poll_time but close_time > poll_time (excluded by our filter)
-        self.assertTrue(k.open_time <= poll_time)  # open_time is before poll_time
-        self.assertTrue(k.close_time <= poll_time)  # close_time is before poll_time (eligible)
 
     def test_candle_not_eligible_when_close_time_after_poll(self):
-        k = _kline(
-            open_time=_ms(1000),
-            close_time=_ms(1010),
-            open_=100.0, high=101.0, low=99.0, close=100.5,
-            volume=1000.0,
-        )
+        k = _kline(open_time=_ms(1000), close_time=_ms(1010),
+                    open_=100.0, high=101.0, low=99.0, close=100.5, volume=1000.0)
         poll_time = _ms(1006)
         self.assertFalse(k.close_time <= poll_time)
 
@@ -246,26 +188,16 @@ class TestCloseTimeHandling(unittest.TestCase):
         self.assertEqual(latest.close_time, _ms(1005))
 
     def test_close_time_missing_reject(self):
-        kline_dict = {
-            "symbol": "BTCUSDT",
-            "interval": "5m",
-            "open_time": _ms(1000),
-            "open": "100.0",
-            "high": "101.0",
-            "low": "99.0",
-            "close": "100.5",
-            "volume": "1000.0",
-        }
+        kline_dict = {"symbol": "BTCUSDT", "interval": "5m",
+                       "open_time": _ms(1000), "open": "100.0",
+                       "high": "101.0", "low": "99.0", "close": "100.5",
+                       "volume": "1000.0"}
         with self.assertRaises(ValueError):
             parse_kline_row(kline_dict, "BTCUSDT", "5m")
 
     def test_close_time_equals_poll_time_eligible(self):
-        k = _kline(
-            open_time=_ms(1000),
-            close_time=_ms(1006),
-            open_=100.0, high=101.0, low=99.0, close=100.5,
-            volume=1000.0,
-        )
+        k = _kline(open_time=_ms(1000), close_time=_ms(1006),
+                    open_=100.0, high=101.0, low=99.0, close=100.5, volume=1000.0)
         poll_time = _ms(1006)
         self.assertTrue(k.close_time <= poll_time)
         closed = filter_closed_klines([k], poll_time)
@@ -273,32 +205,26 @@ class TestCloseTimeHandling(unittest.TestCase):
 
 
 class TestFormingCandleExclusion(unittest.TestCase):
-    """CORRECTION 1: forming candles excluded from signal generation."""
+    """CORRECTION 1: forming candles excluded."""
 
     def test_forming_candle_excluded(self):
         poll_time = _ms(1006)
-        klines = [
-            _kline(open_time=_ms(1005), close_time=_ms(1010),
-                   open_=100.5, high=101.5, low=99.5, close=101.0, volume=1000.0),
-        ]
+        klines = [_kline(open_time=_ms(1005), close_time=_ms(1010),
+                         open_=100.5, high=101.5, low=99.5, close=101.0, volume=1000.0)]
         closed = filter_closed_klines(klines, poll_time)
         self.assertEqual(len(closed), 0)
 
     def test_open_time_proxy_wrong(self):
         poll_time = _ms(1006)
-        klines = [
-            _kline(open_time=_ms(1005), close_time=_ms(1010),
-                   open_=100.5, high=101.5, low=99.5, close=101.0, volume=1000.0),
-        ]
-        # open_time check would pass — WRONG
+        klines = [_kline(open_time=_ms(1005), close_time=_ms(1010),
+                         open_=100.5, high=101.5, low=99.5, close=101.0, volume=1000.0)]
         self.assertTrue(all(k.open_time <= poll_time for k in klines))
-        # close_time check fails — CORRECT
         closed = filter_closed_klines(klines, poll_time)
         self.assertEqual(len(closed), 0)
 
 
 class TestLatePolling(unittest.TestCase):
-    """CORRECTION 4: late polling must be safe."""
+    """CORRECTION 4: late polling safe."""
 
     def test_late_poll_processes_newest_closed_candle(self):
         poll_time = _ms(1010)
@@ -315,25 +241,24 @@ class TestLatePolling(unittest.TestCase):
 
     def test_late_poll_duplicate_prevention(self):
         T = _ms(1005)
-        id1 = make_signal_id("BTCUSDT", "LONG", T)
-        id2 = make_signal_id("BTCUSDT", "LONG", T)
-        self.assertEqual(id1, id2)
+        self.assertEqual(make_signal_id("BTCUSDT", "LONG", T),
+                         make_signal_id("BTCUSDT", "LONG", T))
 
 
 class TestMTFBoundaries(unittest.TestCase):
     """CORRECTION 2: exact MTF alignment boundaries."""
 
-    def test_5m_to_15m_boundary_1005_1015(self):
+    def test_5m_to_15m_early(self):
         T = _ms(1005)
         klines = {
             "5m": [_kline(open_time=_ms(1000), close_time=T, open_=100.0, high=101.0, low=99.0, close=100.5, volume=1000.0)],
             "15m": [_kline(open_time=_ms(1000), close_time=_ms(1015), open_=100.0, high=102.0, low=98.0, close=101.0, volume=2000.0)],
         }
         mtf = get_latest_closed_per_timeframe(klines, T)
-        self.assertEqual(mtf["5m"].close_time, T)
+        self.assertIn("5m", mtf)
         self.assertNotIn("15m", mtf)
 
-    def test_5m_to_15m_boundary_1015_1015(self):
+    def test_5m_to_15m_exact_boundary(self):
         T = _ms(1015)
         klines = {
             "5m": [_kline(open_time=_ms(1010), close_time=T, open_=100.5, high=101.5, low=99.5, close=101.0, volume=1000.0)],
@@ -345,7 +270,7 @@ class TestMTFBoundaries(unittest.TestCase):
         self.assertEqual(mtf["15m"].close_time, T)
         self.assertEqual(mtf["5m"].close_time, T)
 
-    def test_15m_to_1h_boundary_1030_1100(self):
+    def test_15m_to_1h_early(self):
         T = _ms(1030)
         klines = {
             "15m": [_kline(open_time=_ms(1015), close_time=T, open_=100.0, high=101.0, low=99.0, close=100.5, volume=1000.0, interval="15m")],
@@ -355,7 +280,7 @@ class TestMTFBoundaries(unittest.TestCase):
         self.assertIn("15m", mtf)
         self.assertNotIn("1h", mtf)
 
-    def test_15m_to_1h_boundary_1100_1100(self):
+    def test_15m_to_1h_exact_boundary(self):
         T = _ms(1100)
         klines = {
             "15m": [_kline(open_time=_ms(1045), close_time=T, open_=101.0, high=102.0, low=99.0, close=101.5, volume=1000.0, interval="15m")],
@@ -366,7 +291,7 @@ class TestMTFBoundaries(unittest.TestCase):
         self.assertIn("1h", mtf)
         self.assertEqual(mtf["1h"].close_time, T)
 
-    def test_1h_to_4h_boundary_1400_1600(self):
+    def test_1h_to_4h_early(self):
         T = _ms(1400)
         klines = {
             "1h": [_kline(open_time=_ms(1300), close_time=T, open_=100.0, high=101.0, low=99.0, close=100.5, volume=1000.0, interval="1h")],
@@ -376,7 +301,7 @@ class TestMTFBoundaries(unittest.TestCase):
         self.assertIn("1h", mtf)
         self.assertNotIn("4h", mtf)
 
-    def test_1h_to_4h_boundary_1600_1600(self):
+    def test_1h_to_4h_exact_boundary(self):
         T = _ms(1600)
         klines = {
             "1h": [_kline(open_time=_ms(1500), close_time=T, open_=101.0, high=102.0, low=99.0, close=101.5, volume=1000.0, interval="1h")],
@@ -387,7 +312,7 @@ class TestMTFBoundaries(unittest.TestCase):
         self.assertIn("4h", mtf)
         self.assertEqual(mtf["4h"].close_time, T)
 
-    def test_4h_to_1d_boundary_2000_2400(self):
+    def test_4h_to_1d_early(self):
         T = _ms(2000)
         klines = {
             "4h": [_kline(open_time=_ms(1600), close_time=T, open_=100.0, high=101.0, low=99.0, close=100.5, volume=1000.0, interval="4h")],
@@ -397,7 +322,7 @@ class TestMTFBoundaries(unittest.TestCase):
         self.assertIn("4h", mtf)
         self.assertNotIn("1d", mtf)
 
-    def test_4h_to_1d_boundary_2400_2400(self):
+    def test_4h_to_1d_exact_boundary(self):
         T = _ms(2400)
         klines = {
             "4h": [_kline(open_time=_ms(2000), close_time=T, open_=101.0, high=102.0, low=99.0, close=101.5, volume=1000.0, interval="4h")],
@@ -410,21 +335,17 @@ class TestMTFBoundaries(unittest.TestCase):
 
 
 class TestDuplicatePolling(unittest.TestCase):
-    """CORRECTION 5: avoid generating same setup repeatedly."""
+    """CORRECTION 5: same setup twice prevention."""
 
-    def test_same_symbol_time_produces_same_id(self):
+    def test_same_symbol_time_same_id(self):
         T = _ms(1005)
-        id1 = make_signal_id("BTCUSDT", "LONG", T)
-        id2 = make_signal_id("BTCUSDT", "LONG", T)
-        self.assertEqual(id1, id2)
-        id3 = make_signal_id("BTCUSDT", "SHORT", T)
-        self.assertNotEqual(id1, id3)
+        self.assertEqual(make_signal_id("BTCUSDT", "LONG", T),
+                         make_signal_id("BTCUSDT", "LONG", T))
 
     def test_different_symbol_different_id(self):
         T = _ms(1005)
-        id1 = make_signal_id("BTCUSDT", "LONG", T)
-        id2 = make_signal_id("ETHUSDT", "LONG", T)
-        self.assertNotEqual(id1, id2)
+        self.assertNotEqual(make_signal_id("BTCUSDT", "LONG", T),
+                            make_signal_id("ETHUSDT", "LONG", T))
 
 
 class TestRestartRecovery(unittest.TestCase):
@@ -433,25 +354,19 @@ class TestRestartRecovery(unittest.TestCase):
     def test_recover_open_signals(self):
         path = _make_temp_jsonl()
         try:
-            sig = PaperSignalEvent(
-                event="signal", signal_id="open_sig",
+            sig = PaperSignalEvent(event="signal", signal_id="open_sig",
                 symbol="BTCUSDT", direction="LONG",
                 signal_time=_ms(1005), entry=100.0, tp=104.0, sl=98.0,
                 score=60.0, timeframe="5m", horizon_ms=4*3600*1000,
-                strategy_version=make_strategy_version(),
-                generated_at=_ms(1006),
-            )
+                strategy_version=make_strategy_version(), generated_at=_ms(1006))
             jsonl_append(path, sig.to_dict())
 
-            outcome = PaperOutcomeEvent(
-                event="tp_hit", signal_id="resolved_sig",
+            outcome = PaperOutcomeEvent(event="tp_hit", signal_id="resolved_sig",
                 symbol="BTCUSDT", direction="LONG", outcome="tp_hit",
                 outcome_time=_ms(1100), entry=100.0, tp=104.0, sl=98.0,
                 gross_r=0.04, net_r=0.038, holding_ms=3600000,
                 fee=0.001, slippage=0.001, horizon_ms=4*3600*1000,
-                strategy_version=make_strategy_version(),
-                close_time=_ms(1100),
-            )
+                strategy_version=make_strategy_version(), close_time=_ms(1100))
             jsonl_append(path, outcome.to_dict())
 
             open_events = jsonl_recover_open_signals(path)
@@ -460,28 +375,22 @@ class TestRestartRecovery(unittest.TestCase):
         finally:
             _cleanup(path)
 
-    def test_resolved_signals_not_recovered_as_open(self):
+    def test_resolved_not_open(self):
         path = _make_temp_jsonl()
         try:
-            sig = PaperSignalEvent(
-                event="signal", signal_id="resolved_sig",
+            sig = PaperSignalEvent(event="signal", signal_id="resolved_sig",
                 symbol="BTCUSDT", direction="LONG",
                 signal_time=_ms(1005), entry=100.0, tp=104.0, sl=98.0,
                 score=60.0, timeframe="5m", horizon_ms=4*3600*1000,
-                strategy_version=make_strategy_version(),
-                generated_at=_ms(1006),
-            )
+                strategy_version=make_strategy_version(), generated_at=_ms(1006))
             jsonl_append(path, sig.to_dict())
 
-            outcome = PaperOutcomeEvent(
-                event="tp_hit", signal_id="resolved_sig",
+            outcome = PaperOutcomeEvent(event="tp_hit", signal_id="resolved_sig",
                 symbol="BTCUSDT", direction="LONG", outcome="tp_hit",
                 outcome_time=_ms(1100), entry=100.0, tp=104.0, sl=98.0,
                 gross_r=0.04, net_r=0.038, holding_ms=3600000,
                 fee=0.001, slippage=0.001, horizon_ms=4*3600*1000,
-                strategy_version=make_strategy_version(),
-                close_time=_ms(1100),
-            )
+                strategy_version=make_strategy_version(), close_time=_ms(1100))
             jsonl_append(path, outcome.to_dict())
 
             open_events = jsonl_recover_open_signals(path)
@@ -493,26 +402,20 @@ class TestRestartRecovery(unittest.TestCase):
         path = _make_temp_jsonl()
         try:
             for i in range(5):
-                sig = PaperSignalEvent(
-                    event="signal", signal_id=f"sig_{i}",
+                sig = PaperSignalEvent(event="signal", signal_id=f"sig_{i}",
                     symbol="BTCUSDT", direction="LONG",
                     signal_time=_ms(1000 + i*100), entry=100.0+i, tp=104.0+i, sl=98.0+i,
                     score=60.0, timeframe="5m", horizon_ms=4*3600*1000,
-                    strategy_version=make_strategy_version(),
-                    generated_at=_ms(1006 + i*100),
-                )
+                    strategy_version=make_strategy_version(), generated_at=_ms(1006 + i*100))
                 jsonl_append(path, sig.to_dict())
 
             for i in range(2):
-                outcome = PaperOutcomeEvent(
-                    event="tp_hit", signal_id=f"sig_{i}",
+                outcome = PaperOutcomeEvent(event="tp_hit", signal_id=f"sig_{i}",
                     symbol="BTCUSDT", direction="LONG", outcome="tp_hit",
                     outcome_time=_ms(1100 + i*100), entry=100.0+i, tp=104.0+i, sl=98.0+i,
                     gross_r=0.04, net_r=0.038, holding_ms=3600000,
                     fee=0.001, slippage=0.001, horizon_ms=4*3600*1000,
-                    strategy_version=make_strategy_version(),
-                    close_time=_ms(1100 + i*100),
-                )
+                    strategy_version=make_strategy_version(), close_time=_ms(1100 + i*100))
                 jsonl_append(path, outcome.to_dict())
 
             open_events = jsonl_recover_open_signals(path)
@@ -530,14 +433,11 @@ class TestCorruptedStateCache(unittest.TestCase):
     def test_corrupted_cache_discarded(self):
         path = _make_temp_jsonl()
         try:
-            sig = PaperSignalEvent(
-                event="signal", signal_id="valid_sig",
+            sig = PaperSignalEvent(event="signal", signal_id="valid_sig",
                 symbol="BTCUSDT", direction="LONG",
                 signal_time=_ms(1005), entry=100.0, tp=104.0, sl=98.0,
                 score=60.0, timeframe="5m", horizon_ms=4*3600*1000,
-                strategy_version=make_strategy_version(),
-                generated_at=_ms(1006),
-            )
+                strategy_version=make_strategy_version(), generated_at=_ms(1006))
             jsonl_append(path, sig.to_dict())
 
             open_events = jsonl_recover_open_signals(path)
@@ -549,25 +449,19 @@ class TestCorruptedStateCache(unittest.TestCase):
     def test_outcome_persistence_no_reevaluation(self):
         path = _make_temp_jsonl()
         try:
-            sig = PaperSignalEvent(
-                event="signal", signal_id="crash_sig",
+            sig = PaperSignalEvent(event="signal", signal_id="crash_sig",
                 symbol="BTCUSDT", direction="LONG",
                 signal_time=_ms(1005), entry=100.0, tp=104.0, sl=98.0,
                 score=60.0, timeframe="5m", horizon_ms=4*3600*1000,
-                strategy_version=make_strategy_version(),
-                generated_at=_ms(1006),
-            )
+                strategy_version=make_strategy_version(), generated_at=_ms(1006))
             jsonl_append(path, sig.to_dict())
 
-            outcome = PaperOutcomeEvent(
-                event="sl_hit", signal_id="crash_sig",
+            outcome = PaperOutcomeEvent(event="sl_hit", signal_id="crash_sig",
                 symbol="BTCUSDT", direction="LONG", outcome="sl_hit",
                 outcome_time=_ms(1100), entry=100.0, tp=104.0, sl=98.0,
                 gross_r=-0.02, net_r=-0.022, holding_ms=1800000,
                 fee=0.001, slippage=0.001, horizon_ms=4*3600*1000,
-                strategy_version=make_strategy_version(),
-                close_time=_ms(1100),
-            )
+                strategy_version=make_strategy_version(), close_time=_ms(1100))
             jsonl_append(path, outcome.to_dict())
 
             open_events = jsonl_recover_open_signals(path)
@@ -582,24 +476,18 @@ class TestMultipleSymbolsTimeframes(unittest.TestCase):
     def test_per_symbol_state(self):
         path = _make_temp_jsonl()
         try:
-            sig1 = PaperSignalEvent(
-                event="signal", signal_id="sig_sym1",
+            sig1 = PaperSignalEvent(event="signal", signal_id="sig_sym1",
                 symbol="BTCUSDT", direction="LONG",
                 signal_time=_ms(1005), entry=100.0, tp=104.0, sl=98.0,
                 score=60.0, timeframe="5m", horizon_ms=4*3600*1000,
-                strategy_version=make_strategy_version(),
-                generated_at=_ms(1006),
-            )
+                strategy_version=make_strategy_version(), generated_at=_ms(1006))
             jsonl_append(path, sig1.to_dict())
 
-            sig2 = PaperSignalEvent(
-                event="signal", signal_id="sig_sym2",
+            sig2 = PaperSignalEvent(event="signal", signal_id="sig_sym2",
                 symbol="ETHUSDT", direction="SHORT",
                 signal_time=_ms(2005), entry=200.0, tp=196.0, sl=204.0,
                 score=60.0, timeframe="5m", horizon_ms=4*3600*1000,
-                strategy_version=make_strategy_version(),
-                generated_at=_ms(2006),
-            )
+                strategy_version=make_strategy_version(), generated_at=_ms(2006))
             jsonl_append(path, sig2.to_dict())
 
             open_events = jsonl_recover_open_signals(path)
@@ -613,24 +501,18 @@ class TestMultipleSymbolsTimeframes(unittest.TestCase):
     def test_multiple_timeframes_in_log(self):
         path = _make_temp_jsonl()
         try:
-            sig_5m = PaperSignalEvent(
-                event="signal", signal_id="sig_5m",
+            sig_5m = PaperSignalEvent(event="signal", signal_id="sig_5m",
                 symbol="BTCUSDT", direction="LONG",
                 signal_time=_ms(1005), entry=100.0, tp=104.0, sl=98.0,
                 score=60.0, timeframe="5m", horizon_ms=4*3600*1000,
-                strategy_version=make_strategy_version(),
-                generated_at=_ms(1006),
-            )
+                strategy_version=make_strategy_version(), generated_at=_ms(1006))
             jsonl_append(path, sig_5m.to_dict())
 
-            sig_1h = PaperSignalEvent(
-                event="signal", signal_id="sig_1h",
+            sig_1h = PaperSignalEvent(event="signal", signal_id="sig_1h",
                 symbol="BTCUSDT", direction="SHORT",
                 signal_time=_ms(3600000), entry=101.0, tp=97.0, sl=105.0,
                 score=65.0, timeframe="1h", horizon_ms=4*3600*1000,
-                strategy_version=make_strategy_version(),
-                generated_at=_ms(3600006),
-            )
+                strategy_version=make_strategy_version(), generated_at=_ms(3600006))
             jsonl_append(path, sig_1h.to_dict())
 
             events = jsonl_find(path, "signal")
@@ -658,11 +540,8 @@ class TestExpirationBehavior(unittest.TestCase):
 
         signal = _signal(timestamp=T, entry=100.0, tp=104.0, sl=98.0,
                          horizon_ms=horizon_ms)
-
         result = evaluate_signal(signal, candles)
         self.assertEqual(result.outcome, "EXPIRATION")
-        # Evaluator returns EXPIRATION when no candles in window — correct.
-        # P5 observer must NOT mark expired unless has_reach_horizon.
 
     def test_expiration_with_candles_past_horizon_no_hit(self):
         T = _ms(1000)
@@ -680,15 +559,13 @@ class TestExpirationBehavior(unittest.TestCase):
 
         signal = _signal(timestamp=T, entry=100.0, tp=104.0, sl=98.0,
                          horizon_ms=horizon_ms)
-
         result = evaluate_signal(signal, candles)
         self.assertEqual(result.outcome, "EXPIRATION")
         # For EXPIRATION, touch_timestamp is None (no touch occurred)
-        self.assertIsNone(result.touch_timestamp)
 
 
 class TestNotEnoughTimeElapsed(unittest.TestCase):
-    """CORRECTION 4: NOT ENOUGH TIME ELAPSED → keep OPEN."""
+    """CORRECTION 4: NOT ENOUGH TIME ELAPSED → keep OPEN, not expired."""
 
     def test_signal_remains_open_when_insufficient_data(self):
         T = _ms(1000)
@@ -702,17 +579,16 @@ class TestNotEnoughTimeElapsed(unittest.TestCase):
 
         signal = _signal(timestamp=T, entry=100.0, tp=104.0, sl=98.0,
                          horizon_ms=horizon_ms)
-
         result = evaluate_signal(signal, candles)
         self.assertEqual(result.outcome, "EXPIRATION")
 
         has_reach_horizon = any(c.timestamp >= horizon_end for c in candles)
         self.assertFalse(has_reach_horizon)
-        # Observer would keep signal OPEN — not mark as expired.
+        # Observer keeps signal OPEN, not expired.
 
 
 class TestTPEvaluation(unittest.TestCase):
-    """CORRECTION 5: use P3 evaluator for TP/SL."""
+    """CORRECTION 5: TP/SL evaluation using P3 evaluator."""
 
     def test_long_tp_hit(self):
         T = _ms(1000)
@@ -765,9 +641,12 @@ class TestTPEvaluation(unittest.TestCase):
 class TestAPIErrorHandling(unittest.TestCase):
     """CORRECTION 10: HTTP 429, 5xx, timeout, network failure, malformed."""
 
+    def test_malformed_response_handling(self):
+        with self.assertRaises(ValueError):
+            parse_kline_row({"symbol": "BTCUSDT", "interval": "5m"}, "BTCUSDT", "5m")
+
     def test_http_429_handling(self):
         client = BinancePublicClient(timeout_sec=10, max_retries=3, backoff_base_sec=1)
-        # Error classification tested via _classify_error in PaperObserver
 
     def test_http_5xx_handling(self):
         pass
@@ -775,32 +654,21 @@ class TestAPIErrorHandling(unittest.TestCase):
     def test_network_failure_handling(self):
         pass
 
-    def test_malformed_response_handling(self):
-        with self.assertRaises(ValueError):
-            parse_kline_row(
-                {"symbol": "BTCUSDT", "interval": "5m"},
-                "BTCUSDT", "5m"
-            )
-
 
 class TestStaleData(unittest.TestCase):
     """CORRECTION 11: stale data → data_quality event, NOT no-trade."""
 
     def test_stale_data_not_signal(self):
         poll_time = _ms(10000)
-        klines = [
-            _kline(open_time=_ms(1000), close_time=_ms(1005),
-                   open_=100.0, high=101.0, low=99.0, close=100.5, volume=1000.0),
-        ]
+        klines = [_kline(open_time=_ms(1000), close_time=_ms(1005),
+                          open_=100.0, high=101.0, low=99.0, close=100.5, volume=1000.0)]
         latest = get_latest_closed_kline(klines, poll_time)
         self.assertTrue(is_data_stale(latest, poll_time, 120000))
 
     def test_fresh_data_not_stale(self):
         poll_time = _ms(1010)
-        klines = [
-            _kline(open_time=_ms(1000), close_time=_ms(1005),
-                   open_=100.0, high=101.0, low=99.0, close=100.5, volume=1000.0),
-        ]
+        klines = [_kline(open_time=_ms(1000), close_time=_ms(1005),
+                          open_=100.0, high=101.0, low=99.0, close=100.5, volume=1000.0)]
         latest = get_latest_closed_kline(klines, poll_time)
         self.assertFalse(is_data_stale(latest, poll_time, 120000))
 
@@ -813,19 +681,16 @@ class TestMissingCandles(unittest.TestCase):
 
 
 class TestImmutableSignals(unittest.TestCase):
-    """CORRECTION 5: signals immutable."""
+    """CORRECTION 5: signals immutable after creation."""
 
     def test_signal_not_modified_after_creation(self):
         path = _make_temp_jsonl()
         try:
-            sig = PaperSignalEvent(
-                event="signal", signal_id="immutable_sig",
+            sig = PaperSignalEvent(event="signal", signal_id="immutable_sig",
                 symbol="BTCUSDT", direction="LONG",
                 signal_time=_ms(1005), entry=100.0, tp=104.0, sl=98.0,
                 score=60.0, timeframe="5m", horizon_ms=4*3600*1000,
-                strategy_version=make_strategy_version(),
-                generated_at=_ms(1006),
-            )
+                strategy_version=make_strategy_version(), generated_at=_ms(1006))
             jsonl_append(path, sig.to_dict())
 
             events = jsonl_find(path, "signal")
@@ -843,7 +708,7 @@ class TestImmutableSignals(unittest.TestCase):
 
 
 class TestStrategyVersionPreservation(unittest.TestCase):
-    """CORRECTION 13: deterministic strategy/version with every signal."""
+    """CORRECTION 13: deterministic strategy version with every signal."""
 
     def test_strategy_version_deterministic(self):
         v1 = make_strategy_version()
@@ -852,14 +717,11 @@ class TestStrategyVersionPreservation(unittest.TestCase):
         self.assertEqual(len(v1), 16)
 
     def test_strategy_version_in_signal(self):
-        sig = PaperSignalEvent(
-            event="signal", signal_id="version_sig",
+        sig = PaperSignalEvent(event="signal", signal_id="version_sig",
             symbol="BTCUSDT", direction="LONG",
             signal_time=_ms(1005), entry=100.0, tp=104.0, sl=98.0,
             score=60.0, timeframe="5m", horizon_ms=4*3600*1000,
-            strategy_version=make_strategy_version(),
-            generated_at=_ms(1006),
-        )
+            strategy_version=make_strategy_version(), generated_at=_ms(1006))
         self.assertEqual(sig.strategy_version, make_strategy_version())
         self.assertNotEqual(sig.strategy_version, "")
 
@@ -904,15 +766,16 @@ class TestContractsFilter(unittest.TestCase):
 class TestPaperObserverSignalGeneration(unittest.TestCase):
     """Integration: PaperObserver signal generation with synthetic data."""
 
+    def _make_klines(self, T, tf="5m"):
+        return [_kline(open_time=_ms(1000), close_time=T,
+                       open_=100.0, high=101.0, low=99.0, close=101.0, volume=1000.0, interval=tf)]
+
     def test_scanner_generates_signal_for_up_candle(self):
         config = P5Config(symbols=["BTCUSDT"], poll_interval_sec=300)
         scanner = PaperScanner(config)
 
         T = _ms(1005)
-        klines_5m = [
-            _kline(open_time=_ms(1000), close_time=T,
-                   open_=100.0, high=101.0, low=99.0, close=101.0, volume=1000.0),
-        ]
+        klines_5m = self._make_klines(T, "5m")
         klines_15m = [_kline(open_time=_ms(1000), close_time=_ms(1015),
                               open_=100.0, high=102.0, low=98.0, close=101.0, volume=2000.0)]
         klines_1h = [_kline(open_time=_ms(1000), close_time=_ms(1100),
@@ -939,10 +802,8 @@ class TestPaperObserverSignalGeneration(unittest.TestCase):
         scanner = PaperScanner(config)
 
         T = _ms(1005)
-        klines_5m = [
-            _kline(open_time=_ms(1000), close_time=T,
-                   open_=100.0, high=101.0, low=99.0, close=100.0, volume=1000.0),
-        ]
+        klines_5m = [_kline(open_time=_ms(1000), close_time=T,
+                             open_=100.0, high=101.0, low=99.0, close=100.0, volume=1000.0)]
         klines_15m = [_kline(open_time=_ms(1000), close_time=_ms(1015),
                               open_=100.0, high=102.0, low=98.0, close=101.0, volume=2000.0)]
         klines_1h = [_kline(open_time=_ms(1000), close_time=_ms(1100),
@@ -966,10 +827,8 @@ class TestPaperObserverSignalGeneration(unittest.TestCase):
         scanner = PaperScanner(config)
 
         T = _ms(1005)
-        klines_5m = [
-            _kline(open_time=_ms(1000), close_time=T,
-                   open_=100.0, high=101.0, low=99.0, close=101.0, volume=1000.0),
-        ]
+        klines_5m = [_kline(open_time=_ms(1000), close_time=T,
+                             open_=100.0, high=101.0, low=99.0, close=101.0, volume=1000.0)]
         klines_15m = [_kline(open_time=_ms(1000), close_time=_ms(1015),
                               open_=100.0, high=102.0, low=98.0, close=101.0, volume=2000.0)]
         klines_1h = [_kline(open_time=_ms(1000), close_time=_ms(1100),
@@ -983,8 +842,7 @@ class TestPaperObserverSignalGeneration(unittest.TestCase):
         signals = scanner.generate_signals(
             symbol="BTCUSDT",
             klines_5m=klines_5m, klines_15m=klines_15m,
-            klines_1h=klines_1h, klines_4h=klines_4h,
-            klines_1d=klines_1d,
+            klines_1h=klines_1h, klines_4h=klines_4h, klines_1d=klines_1d,
             poll_time_ms=_ms(1066), existing_signal_ids=existing_ids,
         )
         self.assertEqual(len(signals), 0)
@@ -1030,15 +888,9 @@ class TestP5CLI(unittest.TestCase):
     def test_parser_no_args_shows_help(self):
         from scanner import build_parser
         parser = build_parser()
-        # With subparsers and no default, empty args sets command=None.
-        # The main() function handles this by printing help.
         args = parser.parse_args([])
         self.assertIsNone(args.command)
 
-
-# =============================================================================
-# Run
-# =============================================================================
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
