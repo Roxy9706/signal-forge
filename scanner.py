@@ -23,6 +23,7 @@ import sys
 import json
 import hashlib
 import argparse
+import datetime
 from typing import Any, Dict, List, Optional, Tuple, Iterable
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -681,13 +682,19 @@ def build_parser() -> argparse.ArgumentParser:
         help="JSONL log path",
     )
 
-    # --summary --period daily|weekly
+    # --summary --period daily|weekly [--date YYYY-MM-DD]
     summary_parser = subparsers.add_parser("summary", help="On-demand daily/weekly summary")
     summary_parser.add_argument(
         "--period",
         choices=["daily", "weekly"],
         required=True,
         help="Summary period",
+    )
+    summary_parser.add_argument(
+        "--date",
+        type=str,
+        default=None,
+        help="Reference date YYYY-MM-DD (UTC). Default: today UTC.",
     )
     summary_parser.add_argument(
         "--log",
@@ -770,16 +777,109 @@ def cmd_show_recent(args) -> None:
             print(f"  [{etype}] {sid}  {sym}")
 
 
+def _utc_date_from_ms(ms: int) -> str:
+    """Return YYYY-MM-DD UTC string for a millisecond timestamp."""
+    return datetime.datetime.fromtimestamp(ms / 1000.0, tz=datetime.timezone.utc).strftime("%Y-%m-%d")
+
+
+def _parse_date_utc(date_str: str) -> datetime.datetime:
+    """Parse YYYY-MM-DD as a UTC midnight datetime."""
+    return datetime.datetime.strptime(date_str, "%Y-%m-%d").replace(tzinfo=datetime.timezone.utc)
+
+
+def _utc_date_to_day_range(date_str: str) -> Tuple[int, int]:
+    """Return (start_ms, end_ms) for a UTC day (00:00:00 inclusive to next day 00:00:00 exclusive)."""
+    dt = _parse_date_utc(date_str)
+    start = int(dt.timestamp() * 1000)
+    end = int((dt + datetime.timedelta(days=1)).timestamp() * 1000)
+    return start, end
+
+
+def _utc_week_range_from_date(date_str: str) -> Tuple[int, int]:
+    """Return (start_ms, end_ms) for the ISO Mon-Sun week (UTC) containing date_str."""
+    dt = _parse_date_utc(date_str)
+    # ISO weekday: Monday=1 .. Sunday=7
+    weekday = dt.isoweekday()
+    monday = dt - datetime.timedelta(days=weekday - 1)
+    sunday = monday + datetime.timedelta(days=7)
+    start = int(monday.timestamp() * 1000)
+    end = int(sunday.timestamp() * 1000)
+    return start, end
+
+
+def _resolve_period_bounds(args) -> Tuple[str, int, int]:
+    """Return (ref_date_str, period_start_ms, period_end_ms) from CLI args.
+
+    If --date is omitted, use today UTC. This is the ONLY place "now" is read,
+    so the filtering logic itself is deterministic and testable.
+    """
+    if args.date is None:
+        ref_date = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d")
+    else:
+        ref_date = args.date
+
+    if args.period == "daily":
+        period_start, period_end = _utc_date_to_day_range(ref_date)
+    else:
+        period_start, period_end = _utc_week_range_from_date(ref_date)
+    return ref_date, period_start, period_end
+
+
 def cmd_summary(args) -> None:
-    """On-demand daily/weekly summary from JSONL log."""
+    """On-demand daily/weekly summary from JSONL log, filtered by UTC period."""
     events = jsonl_read(args.log)
     if not events:
         print("[P5] No events in log. No summary available.")
         return
 
-    # Filter to signal and outcome events
-    signals = [e for e in events if e.get("event") == "signal"]
-    outcomes = [e for e in events if e.get("event") in ("tp_hit", "sl_hit", "expired")]
+    # Resolve the requested UTC period. If --date omitted, use today UTC.
+    ref_date, period_start, period_end = _resolve_period_bounds(args)
+
+    # Build a human-readable period label
+    if args.period == "daily":
+        period_label = f"Daily ({ref_date} UTC)"
+    else:
+        monday_dt = _parse_date_utc(ref_date) - datetime.timedelta(days=_parse_date_utc(ref_date).isoweekday() - 1)
+        sunday_dt = monday_dt + datetime.timedelta(days=6)
+        period_label = (
+            f"Weekly ({monday_dt.strftime('%Y-%m-%d')}–"
+            f"{sunday_dt.strftime('%Y-%m-%d')} UTC)"
+        )
+
+    # Deterministic period predicate (UTC millisecond boundaries, half-open).
+    # Signals use signal_time; outcomes use outcome_time; data_quality uses poll_time.
+    def _in_period(ev: Dict[str, Any]) -> bool:
+        ts = None
+        etype = ev.get("event")
+        if etype == "signal":
+            ts = ev.get("signal_time", 0)
+        elif etype in ("tp_hit", "sl_hit", "expired"):
+            ts = ev.get("outcome_time", 0)
+        elif etype == "data_quality":
+            ts = ev.get("poll_time", 0) or ev.get("generated_at", 0)
+        else:
+            ts = ev.get("signal_time", 0) or ev.get("outcome_time", 0) or ev.get("generated_at", 0)
+        if ts is None or not isinstance(ts, (int, float)):
+            return False
+        return period_start <= ts < period_end
+
+    # Filter signal/outcome events by the period timestamp.
+    # Signals: filtered by signal_time.
+    # Outcomes: filtered by outcome_time.
+    signals = [e for e in events if e.get("event") == "signal" and _in_period(e)]
+    outcomes = [e for e in events if e.get("event") in ("tp_hit", "sl_hit", "expired") and _in_period(e)]
+
+    # Open signals: unresolved signals anywhere in the log.
+    # A signal created BEFORE this period but still open DURING this period
+    # is counted in "Open (unresolved)" for the period, but NOT in
+    # "Signals (total)" (which counts only signals whose signal_time falls
+    # inside the period). Document this in the output.
+    open_ids = jsonl_get_open_signal_ids(args.log)
+    open_count = len(open_ids)
+
+    # Data quality events in the period
+    dq_events = [e for e in events if e.get("event") == "data_quality" and _in_period(e)]
+    dq_count = len(dq_events)
 
     # Count by outcome type
     tp_count = sum(1 for o in outcomes if o.get("outcome") == "tp_hit")
@@ -790,18 +890,10 @@ def cmd_summary(args) -> None:
     gross_r_total = sum(o.get("gross_r", 0.0) for o in outcomes)
     net_r_total = sum(o.get("net_r", 0.0) for o in outcomes)
 
-    # Open signals
-    open_ids = jsonl_get_open_signal_ids(args.log)
-    open_count = len(open_ids)
-
-    # Data quality events
-    dq_events = [e for e in events if e.get("event") == "data_quality"]
-    dq_count = len(dq_events)
-
-    # Unique symbols
+    # Symbols from period signals
     symbols = sorted(set(e.get("symbol", "?") for e in signals))
 
-    # Time range
+    # Time range from period events (signal_time / outcome_time)
     times = [e.get("signal_time", 0) for e in signals] + \
             [e.get("outcome_time", 0) for e in outcomes]
     times = [t for t in times if t > 0]
@@ -811,15 +903,16 @@ def cmd_summary(args) -> None:
     else:
         first_time = last_time = 0
 
-    print(f"[P5] {'Daily' if args.period == 'daily' else 'Weekly'} Summary")
+    print(f"[P5] {period_label}")
     print("=" * 60)
-    print(f"Period: {args.period}")
+    print(f"Period: {args.period} — {ref_date}")
     print(f"Symbols: {', '.join(symbols) if symbols else 'none'}")
     print(f"Time range: {first_time} — {last_time}")
     print()
     print(f"Signals (total):    {len(signals)}")
     print(f"  Completed:        {len(outcomes)}")
     print(f"  Open (unresolved): {open_count}")
+    print(f"    (includes signals from prior periods still open in this period)")
     print(f"  Data quality events: {dq_count}")
     print()
     print(f"--- Outcomes ---")
