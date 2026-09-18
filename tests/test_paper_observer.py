@@ -218,12 +218,25 @@ class TestCloseTimeHandling(unittest.TestCase):
         self.assertEqual(latest.close_time, _ms(1005))
 
     def test_close_time_missing_reject(self):
-        kline_dict = {"symbol": "BTCUSDT", "interval": "5m",
-                       "open_time": _ms(1000), "open": "100.0",
-                       "high": "101.0", "low": "99.0", "close": "100.5",
-                       "volume": "1000.0"}
+        # parse_kline_row expects a Binance kline list with >=12 fields.
+        # If close_time (index 6) is <= 0, the function MUST raise ValueError
+        # and NOT fall back to open_time.
+        kline_row = [
+            _ms(1000),        # 0: open_time
+            "100.0",          # 1: open
+            "101.0",          # 2: high
+            "99.0",           # 3: low
+            "100.5",          # 4: close
+            "1000.0",         # 5: volume
+            "0",              # 6: close_time — invalid (must be > 0)
+            "100.0",          # 7
+            "100.5",          # 8
+            "500.0",          # 9
+            "0",              # 10
+            "0",              # 11
+        ]
         with self.assertRaises(ValueError):
-            parse_kline_row(kline_dict, "BTCUSDT", "5m")
+            parse_kline_row(kline_row, "BTCUSDT", "5m")
 
     def test_close_time_equals_poll_time_eligible(self):
         k = _kline(open_time=_ms(1000), close_time=_ms(1006),
@@ -672,8 +685,10 @@ class TestAPIErrorHandling(unittest.TestCase):
     """CORRECTION 10: HTTP 429, 5xx, timeout, network failure, malformed."""
 
     def test_malformed_response_handling(self):
+        # parse_kline_row expects a Binance kline list with >=12 fields;
+        # a too-short list must raise ValueError.
         with self.assertRaises(ValueError):
-            parse_kline_row({"symbol": "BTCUSDT", "interval": "5m"}, "BTCUSDT", "5m")
+            parse_kline_row([1, 2, 3], "BTCUSDT", "5m")
 
     def test_http_429_handling(self):
         client = BinancePublicClient(timeout_sec=10, max_retries=3, backoff_base_sec=1)
