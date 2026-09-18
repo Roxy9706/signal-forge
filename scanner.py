@@ -67,6 +67,7 @@ from SignalForge.paper.models import (
     make_signal_id,
     make_strategy_version,
 )
+from indicators.d15_decision import d15_final_decision
 
 
 # ---------------------------------------------------------------------------
@@ -174,44 +175,124 @@ class PaperScanner:
         # with close_time <= latest_5m.close_time (the signal time T)
         T = latest_5m.close_time
 
-        mtf = get_latest_closed_per_timeframe(
-            {
-                "5m": closed_5m,
-                "15m": closed_15m,
-                "1h": closed_1h,
-                "4h": closed_4h,
-                "1d": closed_1d,
-            },
-            T,
-        )
-
-        # Determine direction from strategy.
         # ---------------------------------------------------------------------------
-        # PLACEHOLDER DISABLED: no real P1 strategy wired yet.
-        # The scanner MUST NOT emit fake strategy signals. Until the frozen P1
-        # strategy (40/20/20/20; 25/25/20/20/10; ATR/RSI/EMA/structure/volume)
-        # is plugged in, produce NO_TRADE so the pipeline stays quiet.
+        # Convert Kline objects → dict format for D8/D15 indicator functions.
+        # Each dict carries: open_time, close_time, open, high, low, close, volume.
         # ---------------------------------------------------------------------------
-        direction = "NO_TRADE"  # TODO: replace with real P1 strategy call
+        def _kline_to_dict(k: Kline) -> dict:
+            return {
+                "open_time": k.open_time,
+                "close_time": k.close_time,
+                "open": k.open,
+                "high": k.high,
+                "low": k.low,
+                "close": k.close,
+                "volume": k.volume,
+            }
 
-        # Early exit: nothing to generate or dedupe for NO_TRADE.
-        # When the real P1 strategy is wired, direction will be LONG or SHORT
-        # and execution continues to the duplicate check below.
-        if direction == "NO_TRADE":
+        # ---------------------------------------------------------------------------
+        # Build per-TF historical candle sequences filtered to close_time <= T.
+        # This is mandatory anti-lookahead protection: NO candle with
+        # close_time > T may enter D8 or any downstream stage.
+        # ---------------------------------------------------------------------------
+        candles_by_tf = {
+            "5m":  [_kline_to_dict(k) for k in closed_5m if k.close_time <= T],
+            "15m": [_kline_to_dict(k) for k in closed_15m if k.close_time <= T],
+            "1h":  [_kline_to_dict(k) for k in closed_1h  if k.close_time <= T],
+            "4h":  [_kline_to_dict(k) for k in closed_4h  if k.close_time <= T],
+            "1d":  [_kline_to_dict(k) for k in closed_1d  if k.close_time <= T],
+        }
+
+        # candles_5m: the FULL closed 5m sequence through setup, each <= T
+        candles_5m = candles_by_tf["5m"]
+
+        # setup_index: index of the setup candle in candles_5m.
+        # The setup candle is the latest closed 5m candle, so it is the
+        # last element of candles_5m (which is sorted ascending by close_time).
+        setup_index = len(candles_5m) - 1
+        if setup_index < 0:
             return []
 
-        # Duplicate check uses the ACTUAL calculated direction (not hardcoded).
-        # Same (symbol, direction, closed-candle close_time) -> same signal_id
-        # -> rejected. Different timestamp or different direction -> distinct.
+        setup_5m = candles_5m[setup_index]
+
+        # candles_5m_before_setup: excludes the setup candle (indices [0, setup_index))
+        candles_5m_before_setup = candles_5m[:setup_index]
+
+        # candles_5m_through_setup: includes the setup candle (indices [0, setup_index])
+        candles_5m_through_setup = candles_5m[:setup_index + 1]
+
+        # ---------------------------------------------------------------------------
+        # Call D15 exactly once for the setup candle.
+        # D15 orchestrates D8 → D7 → D10 → D11/D12 → D13 → D14 and returns:
+        #   direction, entry, final_sl, take_profit, signal_time,
+        #   final_long, final_short, status
+        # ---------------------------------------------------------------------------
+        d15_result = d15_final_decision(
+            candles_by_tf=candles_by_tf,
+            candles_5m=candles_5m,
+            setup_index=setup_index,
+            setup_5m=setup_5m,
+            candles_5m_before_setup=candles_5m_before_setup,
+            candles_5m_through_setup=candles_5m_through_setup,
+        )
+
+        # ---------------------------------------------------------------------------
+        # Non-OK D15 statuses produce NO signal.
+        # status == "OK" is the only path that generates a PaperSignal.
+        # ---------------------------------------------------------------------------
+        if d15_result["status"] != "OK":
+            return []
+
+        direction = d15_result["direction"]
+        entry = d15_result["entry"]
+        final_sl = d15_result["final_sl"]
+        take_profit = d15_result["take_profit"]
+        signal_time = d15_result["signal_time"]
+        final_long = d15_result["final_long"]
+        final_short = d15_result["final_short"]
+
+        # ---------------------------------------------------------------------------
+        # Duplicate check — uses the ACTUAL calculated direction from D15.
+        # Same (symbol, direction, setup close_time) → same signal_id → rejected.
+        # existing_signal_ids is NOT mutated here (caller manages the set).
+        # ---------------------------------------------------------------------------
         candidate_id = make_signal_id(symbol, direction, T)
         if candidate_id in existing_signal_ids:
-            return []  # duplicate
+            return []
 
-        # Signal construction (entry, SL, TP, score, ATR, RSI, EMA, structure,
-        # volume, R:R) is performed by the real P1 strategy.
-        # Placeholder signal construction removed — no fake signals emitted.
-        # TODO: replace with real P1 strategy signal construction.
-        return []
+        # ---------------------------------------------------------------------------
+        # Score: LONG uses final_long, SHORT uses final_short.
+        # ---------------------------------------------------------------------------
+        if direction == "LONG":
+            score = final_long
+        elif direction == "SHORT":
+            score = final_short
+        else:
+            # D15 OK path should only return LONG or SHORT, but guard anyway.
+            return []
+
+        # ---------------------------------------------------------------------------
+        # Build PaperSignalEvent with fields from D15 result.
+        # PaperSignalEvent.event = "signal" (fixed); signal_time = T (setup close_time).
+        # strategy_version from config; generated_at = poll_time_ms.
+        # ---------------------------------------------------------------------------
+        signal_version = self.config.strategy_version or make_strategy_version()
+        sig = PaperSignalEvent(
+            event="signal",
+            signal_id=candidate_id,
+            symbol=symbol,
+            direction=direction,
+            signal_time=T,
+            entry=entry,
+            tp=take_profit,
+            sl=final_sl,
+            score=score,
+            timeframe="5m",
+            horizon_ms=self.config.horizon_ms,
+            strategy_version=signal_version,
+            generated_at=poll_time_ms,
+        )
+        return [sig]
 
 
 # ---------------------------------------------------------------------------

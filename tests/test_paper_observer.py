@@ -1245,6 +1245,772 @@ class TestP5DuplicateSignalIdBug(unittest.TestCase):
         self.assertEqual(short_id, make_signal_id("BTCUSDT", "SHORT", T))
 
 
+# ---------------------------------------------------------------------------
+# D15 integration tests — verify generate_signals() correctly wires the
+# frozen D15 pipeline. Tests mock d15_final_decision so they remain
+# deterministic and do not depend on live indicator internals.
+# ---------------------------------------------------------------------------
+
+class TestScannerD15Integration(unittest.TestCase):
+    """Verify scanner.generate_signals() connects to D15 correctly."""
+
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
+
+    def _kline(self, open_time, close_time, open_, high, low, close, volume,
+               interval="5m", symbol="BTCUSDT"):
+        return Kline(
+            symbol=symbol,
+            interval=interval,
+            open_time=open_time,
+            close_time=close_time,
+            open=open_,
+            high=high,
+            low=low,
+            close=close,
+            volume=volume,
+        )
+
+    def _make_config(self, symbols=None, strategy_version=""):
+        from scanner import P5Config
+        return P5Config(symbols=symbols or ["BTCUSDT"],
+                        strategy_version=strategy_version)
+
+    def _klines_all_closed_at_T(self, T, symbol="BTCUSDT"):
+        """One closed kline per timeframe, all with close_time <= T."""
+        return {
+            "5m":  [self._kline(_ms(1000), T, 100.0, 101.0, 99.0, 101.0, 1000.0,
+                                interval="5m", symbol=symbol)],
+            "15m": [self._kline(_ms(1000), T, 100.0, 102.0, 98.0, 101.0, 2000.0,
+                                 interval="15m", symbol=symbol)],
+            "1h":  [self._kline(_ms(1000), T, 100.0, 105.0, 95.0, 102.0, 5000.0,
+                                 interval="1h", symbol=symbol)],
+            "4h":  [self._kline(_ms(1000), T, 100.0, 110.0, 90.0, 105.0, 10000.0,
+                                 interval="4h", symbol=symbol)],
+            "1d":  [self._kline(_ms(0),    T, 100.0, 120.0, 80.0, 110.0, 50000.0,
+                                 interval="1d", symbol=symbol)],
+        }
+
+    def _klines_with_forming_5m(self, T, poll_time_ms):
+        """5m has a forming candle (close_time > cutoff); higher TFs are closed."""
+        closed_5m = []
+        forming_5m = self._kline(_ms(1000), poll_time_ms + _ms(300),  # close_time > poll_time
+                                  100.0, 101.0, 99.0, 101.0, 1000.0,
+                                  interval="5m", symbol="BTCUSDT")
+        return {
+            "5m":  [forming_5m],
+            "15m": [self._kline(_ms(1000), T, 100.0, 102.0, 98.0, 101.0, 2000.0,
+                                 interval="15m", symbol="BTCUSDT")],
+            "1h":  [self._kline(_ms(1000), T, 100.0, 105.0, 95.0, 102.0, 5000.0,
+                                 interval="1h", symbol="BTCUSDT")],
+            "4h":  [self._kline(_ms(1000), T, 100.0, 110.0, 90.0, 105.0, 10000.0,
+                                 interval="4h", symbol="BTCUSDT")],
+            "1d":  [self._kline(_ms(0),    T, 100.0, 120.0, 80.0, 110.0, 50000.0,
+                                 interval="1d", symbol="BTCUSDT")],
+        }
+
+    def _d15_ok_result(self, direction="LONG", entry=101.0, sl=98.0,
+                       tp=104.0, signal_time=105, final_long=80.0,
+                       final_short=20.0):
+        return {
+            "direction": direction,
+            "entry": entry,
+            "final_sl": sl,
+            "take_profit": tp,
+            "signal_time": signal_time,
+            "final_long": final_long,
+            "final_short": final_short,
+            "status": "OK",
+            "rr": 2.0,
+            "stage_status": {},
+            "reason": None,
+        }
+
+    def _d15_not_ok_result(self, status="NO_TRADE", reason="D8 failure"):
+        return {
+            "direction": "NO_TRADE",
+            "entry": None,
+            "final_sl": None,
+            "take_profit": None,
+            "signal_time": None,
+            "final_long": 50.0,
+            "final_short": 50.0,
+            "status": status,
+            "rr": None,
+            "stage_status": {},
+            "reason": reason,
+        }
+
+    # ------------------------------------------------------------------
+    # 1. D15 is actually invoked from generate_signals()
+    # ------------------------------------------------------------------
+
+    def test_generate_signals_calls_d15(self):
+        """When closed 5m candles exist, generate_signals() calls D15."""
+        from scanner import PaperScanner
+        from unittest.mock import patch
+
+        config = self._make_config()
+        scanner = PaperScanner(config)
+        T = _ms(1005)
+        klines = self._klines_all_closed_at_T(T)
+        poll_time = T + _ms(60)  # past buffer
+
+        with patch("scanner.d15_final_decision") as mock_d15:
+            mock_d15.return_value = self._d15_ok_result()
+            signals = scanner.generate_signals(
+                symbol="BTCUSDT",
+                klines_5m=klines["5m"], klines_15m=klines["15m"],
+                klines_1h=klines["1h"], klines_4h=klines["4h"], klines_1d=klines["1d"],
+                poll_time_ms=poll_time, existing_signal_ids=set(),
+            )
+            self.assertTrue(mock_d15.called,
+                            "generate_signals must call d15_final_decision")
+
+    # ------------------------------------------------------------------
+    # 2. LONG score uses final_long
+    # ------------------------------------------------------------------
+
+    def test_long_score_uses_final_long(self):
+        """When D15 returns LONG, score = final_long."""
+        from scanner import PaperScanner
+        from unittest.mock import patch
+
+        config = self._make_config()
+        scanner = PaperScanner(config)
+        T = _ms(1005)
+        klines = self._klines_all_closed_at_T(T)
+        poll_time = T + _ms(60)
+
+        with patch("scanner.d15_final_decision") as mock_d15:
+            mock_d15.return_value = self._d15_ok_result(
+                direction="LONG", entry=101.0, sl=98.0, tp=104.0,
+                signal_time=T, final_long=73.5, final_short=40.0,
+            )
+            signals = scanner.generate_signals(
+                symbol="BTCUSDT",
+                klines_5m=klines["5m"], klines_15m=klines["15m"],
+                klines_1h=klines["1h"], klines_4h=klines["4h"], klines_1d=klines["1d"],
+                poll_time_ms=poll_time, existing_signal_ids=set(),
+            )
+            self.assertEqual(len(signals), 1)
+            sig = signals[0]
+            self.assertEqual(sig.direction, "LONG")
+            self.assertEqual(sig.score, 73.5,
+                             "LONG score must equal D15 final_long")
+            self.assertNotEqual(sig.score, 40.0,
+                                 "LONG score must NOT be final_short")
+
+    # ------------------------------------------------------------------
+    # 3. SHORT score uses final_short
+    # ------------------------------------------------------------------
+
+    def test_short_score_uses_final_short(self):
+        """When D15 returns SHORT, score = final_short."""
+        from scanner import PaperScanner
+        from unittest.mock import patch
+
+        config = self._make_config()
+        scanner = PaperScanner(config)
+        T = _ms(2005)
+        klines = self._klines_all_closed_at_T(T, symbol="ETHUSDT")
+        poll_time = T + _ms(60)
+
+        with patch("scanner.d15_final_decision") as mock_d15:
+            mock_d15.return_value = self._d15_ok_result(
+                direction="SHORT", entry=99.0, sl=102.0, tp=96.0,
+                signal_time=T, final_long=30.0, final_short=88.0,
+            )
+            signals = scanner.generate_signals(
+                symbol="ETHUSDT",
+                klines_5m=klines["5m"], klines_15m=klines["15m"],
+                klines_1h=klines["1h"], klines_4h=klines["4h"], klines_1d=klines["1d"],
+                poll_time_ms=poll_time, existing_signal_ids=set(),
+            )
+            self.assertEqual(len(signals), 1)
+            sig = signals[0]
+            self.assertEqual(sig.direction, "SHORT")
+            self.assertEqual(sig.score, 88.0,
+                             "SHORT score must equal D15 final_short")
+            self.assertNotEqual(sig.score, 30.0,
+                                 "SHORT score must NOT be final_long")
+
+    # ------------------------------------------------------------------
+    # 4. D15 non-OK → no signal
+    # ------------------------------------------------------------------
+
+    def test_d15_not_ok_produces_no_signal(self):
+        """Any non-OK D15 status returns zero signals."""
+        from scanner import PaperScanner
+        from unittest.mock import patch
+
+        config = self._make_config()
+        scanner = PaperScanner(config)
+        T = _ms(1005)
+        klines = self._klines_all_closed_at_T(T)
+        poll_time = T + _ms(60)
+
+        for status in ("NO_TRADE", "DATA_UNAVAILABLE", "INVALID_INPUT"):
+            with patch("scanner.d15_final_decision") as mock_d15:
+                mock_d15.return_value = self._d15_not_ok_result(status=status)
+                signals = scanner.generate_signals(
+                    symbol="BTCUSDT",
+                    klines_5m=klines["5m"], klines_15m=klines["15m"],
+                    klines_1h=klines["1h"], klines_4h=klines["4h"], klines_1d=klines["1d"],
+                    poll_time_ms=poll_time, existing_signal_ids=set(),
+                )
+                self.assertEqual(len(signals), 0,
+                                 f"status={status} must produce no signal")
+
+    # ------------------------------------------------------------------
+    # 5. Exact six D15 arguments
+    # ------------------------------------------------------------------
+
+    def test_d15_called_with_exact_six_arguments(self):
+        """D15 must be called with exactly six keyword arguments."""
+        from scanner import PaperScanner
+        from unittest.mock import patch, call
+
+        config = self._make_config()
+        scanner = PaperScanner(config)
+        T = _ms(1005)
+        klines = self._klines_all_closed_at_T(T)
+        poll_time = T + _ms(60)
+
+        with patch("scanner.d15_final_decision") as mock_d15:
+            mock_d15.return_value = self._d15_ok_result()
+            scanner.generate_signals(
+                symbol="BTCUSDT",
+                klines_5m=klines["5m"], klines_15m=klines["15m"],
+                klines_1h=klines["1h"], klines_4h=klines["4h"], klines_1d=klines["1d"],
+                poll_time_ms=poll_time, existing_signal_ids=set(),
+            )
+            self.assertEqual(mock_d15.call_count, 1)
+            call_kwargs = mock_d15.call_args.kwargs
+            expected_keys = {
+                "candles_by_tf", "candles_5m", "setup_index", "setup_5m",
+                "candles_5m_before_setup", "candles_5m_through_setup",
+            }
+            self.assertEqual(set(call_kwargs.keys()), expected_keys,
+                             "D15 must receive exactly six arguments")
+            # Verify each argument is the expected type.
+            self.assertIsInstance(call_kwargs["candles_by_tf"], dict)
+            self.assertIsInstance(call_kwargs["candles_5m"], list)
+            self.assertIsInstance(call_kwargs["setup_index"], int)
+            self.assertIsInstance(call_kwargs["setup_5m"], dict)
+            self.assertIsInstance(call_kwargs["candles_5m_before_setup"], list)
+            self.assertIsInstance(call_kwargs["candles_5m_through_setup"], list)
+
+    # ------------------------------------------------------------------
+    # 6. 5m setup index
+    # ------------------------------------------------------------------
+
+    def test_setup_index_is_last_closed_5m(self):
+        """setup_index must equal len(candles_5m) - 1 (latest closed 5m)."""
+        from scanner import PaperScanner
+        from unittest.mock import patch
+
+        config = self._make_config()
+        scanner = PaperScanner(config)
+        T = _ms(1005)
+        klines = self._klines_all_closed_at_T(T)
+        poll_time = T + _ms(60)
+
+        with patch("scanner.d15_final_decision") as mock_d15:
+            mock_d15.return_value = self._d15_ok_result()
+            scanner.generate_signals(
+                symbol="BTCUSDT",
+                klines_5m=klines["5m"], klines_15m=klines["15m"],
+                klines_1h=klines["1h"], klines_4h=klines["4h"], klines_1d=klines["1d"],
+                poll_time_ms=poll_time, existing_signal_ids=set(),
+            )
+            call_kwargs = mock_d15.call_args.kwargs
+            # There is exactly one closed 5m candle at T.
+            self.assertEqual(call_kwargs["setup_index"], 0,
+                             "setup_index should be 0 for a single closed 5m candle")
+            self.assertEqual(call_kwargs["setup_5m"]["close_time"], T)
+
+    def test_setup_index_singleton_with_multiple_5m_candles(self):
+        """When multiple closed 5m candles exist, setup_index is the last one."""
+        from scanner import PaperScanner
+        from unittest.mock import patch
+
+        config = self._make_config()
+        scanner = PaperScanner(config)
+        T = _ms(1005)
+        # Two closed 5m candles: one before setup, one at setup.
+        klines = {
+            "5m": [
+                self._kline(_ms(900), _ms(995), 100.0, 101.0, 99.0, 100.5, 1000.0,
+                            interval="5m", symbol="BTCUSDT"),
+                self._kline(_ms(1000), T, 100.0, 101.0, 99.0, 101.0, 1000.0,
+                            interval="5m", symbol="BTCUSDT"),
+            ],
+            "15m": [self._kline(_ms(1000), T, 100.0, 102.0, 98.0, 101.0, 2000.0,
+                                 interval="15m", symbol="BTCUSDT")],
+            "1h":  [self._kline(_ms(1000), T, 100.0, 105.0, 95.0, 102.0, 5000.0,
+                                 interval="1h", symbol="BTCUSDT")],
+            "4h":  [self._kline(_ms(1000), T, 100.0, 110.0, 90.0, 105.0, 10000.0,
+                                 interval="4h", symbol="BTCUSDT")],
+            "1d":  [self._kline(_ms(0),    T, 100.0, 120.0, 80.0, 110.0, 50000.0,
+                                 interval="1d", symbol="BTCUSDT")],
+        }
+        poll_time = T + _ms(60)
+
+        with patch("scanner.d15_final_decision") as mock_d15:
+            mock_d15.return_value = self._d15_ok_result()
+            scanner.generate_signals(
+                symbol="BTCUSDT",
+                klines_5m=klines["5m"], klines_15m=klines["15m"],
+                klines_1h=klines["1h"], klines_4h=klines["4h"], klines_1d=klines["1d"],
+                poll_time_ms=poll_time, existing_signal_ids=set(),
+            )
+            call_kwargs = mock_d15.call_args.kwargs
+            self.assertEqual(call_kwargs["setup_index"], 1,
+                             "setup_index should be 1 for two closed 5m candles")
+            self.assertEqual(call_kwargs["setup_5m"]["close_time"], T)
+            self.assertEqual(len(call_kwargs["candles_5m"]), 2)
+
+    # ------------------------------------------------------------------
+    # 7. before_setup excludes setup candle
+    # ------------------------------------------------------------------
+
+    def test_before_setup_excludes_setup(self):
+        """candles_5m_before_setup must NOT contain the setup candle."""
+        from scanner import PaperScanner
+        from unittest.mock import patch
+
+        config = self._make_config()
+        scanner = PaperScanner(config)
+        T = _ms(1005)
+        klines = self._klines_all_closed_at_T(T)
+        poll_time = T + _ms(60)
+
+        with patch("scanner.d15_final_decision") as mock_d15:
+            mock_d15.return_value = self._d15_ok_result()
+            scanner.generate_signals(
+                symbol="BTCUSDT",
+                klines_5m=klines["5m"], klines_15m=klines["15m"],
+                klines_1h=klines["1h"], klines_4h=klines["4h"], klines_1d=klines["1d"],
+                poll_time_ms=poll_time, existing_signal_ids=set(),
+            )
+            call_kwargs = mock_d15.call_args.kwargs
+            before = call_kwargs["candles_5m_before_setup"]
+            setup_close = call_kwargs["setup_5m"]["close_time"]
+            for c in before:
+                self.assertNotEqual(c["close_time"], setup_close,
+                                    "before_setup must exclude the setup candle")
+
+    # ------------------------------------------------------------------
+    # 8. through_setup includes setup candle
+    # ------------------------------------------------------------------
+
+    def test_through_setup_includes_setup(self):
+        """candles_5m_through_setup must contain the setup candle."""
+        from scanner import PaperScanner
+        from unittest.mock import patch
+
+        config = self._make_config()
+        scanner = PaperScanner(config)
+        T = _ms(1005)
+        klines = self._klines_all_closed_at_T(T)
+        poll_time = T + _ms(60)
+
+        with patch("scanner.d15_final_decision") as mock_d15:
+            mock_d15.return_value = self._d15_ok_result()
+            scanner.generate_signals(
+                symbol="BTCUSDT",
+                klines_5m=klines["5m"], klines_15m=klines["15m"],
+                klines_1h=klines["1h"], klines_4h=klines["4h"], klines_1d=klines["1d"],
+                poll_time_ms=poll_time, existing_signal_ids=set(),
+            )
+            call_kwargs = mock_d15.call_args.kwargs
+            through = call_kwargs["candles_5m_through_setup"]
+            setup_close = call_kwargs["setup_5m"]["close_time"]
+            found = any(c["close_time"] == setup_close for c in through)
+            self.assertTrue(found,
+                            "through_setup must include the setup candle")
+
+    # ------------------------------------------------------------------
+    # 9. Higher-TF candle with close_time > T is excluded
+    # ------------------------------------------------------------------
+
+    def test_higher_tf_candle_past_T_excluded_from_d15(self):
+        """A higher-TF candle whose close_time > T must NOT reach D8/D15."""
+        from scanner import PaperScanner
+        from unittest.mock import patch
+
+        config = self._make_config()
+        scanner = PaperScanner(config)
+        T = _ms(1005)
+        # Include a 1h candle with close_time > T (look-ahead).
+        klines = self._klines_all_closed_at_T(T)
+        klines["1h"].append(
+            self._kline(_ms(1000), T + _ms(1000), 100.0, 105.0, 95.0, 103.0, 5000.0,
+                        interval="1h", symbol="BTCUSDT")
+        )
+        poll_time = T + _ms(60)
+
+        with patch("scanner.d15_final_decision") as mock_d15:
+            mock_d15.return_value = self._d15_ok_result()
+            scanner.generate_signals(
+                symbol="BTCUSDT",
+                klines_5m=klines["5m"], klines_15m=klines["15m"],
+                klines_1h=klines["1h"], klines_4h=klines["4h"], klines_1d=klines["1d"],
+                poll_time_ms=poll_time, existing_signal_ids=set(),
+            )
+            call_kwargs = mock_d15.call_args.kwargs
+            candles_1h = call_kwargs["candles_by_tf"]["1h"]
+            for c in candles_1h:
+                self.assertLessEqual(c["close_time"], T,
+                                     "no candle with close_time > T may reach D15")
+
+    # ------------------------------------------------------------------
+    # 10. Forming candle cannot reach D15
+    # ------------------------------------------------------------------
+
+    def test_forming_candle_excluded_from_d15(self):
+        """A forming 5m candle (close_time > cutoff) must not reach D15."""
+        from scanner import PaperScanner
+        from unittest.mock import patch
+
+        config = self._make_config()
+        scanner = PaperScanner(config)
+        T = _ms(1005)
+        poll_time = T + _ms(60)
+        # All 5m candles are forming (close_time > poll_time - buffer).
+        klines = self._klines_with_forming_5m(T, poll_time)
+        # The only closed candles are the higher TFs. But closed_5m will be empty.
+
+        with patch("scanner.d15_final_decision") as mock_d15:
+            mock_d15.return_value = self._d15_ok_result()
+            signals = scanner.generate_signals(
+                symbol="BTCUSDT",
+                klines_5m=klines["5m"], klines_15m=klines["15m"],
+                klines_1h=klines["1h"], klines_4h=klines["4h"], klines_1d=klines["1d"],
+                poll_time_ms=poll_time, existing_signal_ids=set(),
+            )
+            # No closed 5m candles → no D15 call, no signal.
+            self.assertFalse(mock_d15.called,
+                             "forming-only 5m must not call D15")
+            self.assertEqual(len(signals), 0)
+
+    def test_forming_candle_in_5m_excluded_from_d15_when_higher_tfs_closed(self):
+        """When 5m is forming but higher TFs are closed, D15 still not called."""
+        from scanner import PaperScanner
+        from unittest.mock import patch
+
+        config = self._make_config()
+        scanner = PaperScanner(config)
+        T = _ms(1005)
+        poll_time = T + _ms(60)
+        # 5m forming candle with close_time > cutoff, but higher TFs closed at T.
+        klines = {
+            "5m": [
+                self._kline(_ms(1000), poll_time + _ms(300),  # forming (close_time > poll_time)
+                            100.0, 101.0, 99.0, 101.0, 1000.0,
+                            interval="5m", symbol="BTCUSDT"),
+            ],
+            "15m": [self._kline(_ms(1000), T, 100.0, 102.0, 98.0, 101.0, 2000.0,
+                                 interval="15m", symbol="BTCUSDT")],
+            "1h":  [self._kline(_ms(1000), T, 100.0, 105.0, 95.0, 102.0, 5000.0,
+                                 interval="1h", symbol="BTCUSDT")],
+            "4h":  [self._kline(_ms(1000), T, 100.0, 110.0, 90.0, 105.0, 10000.0,
+                                 interval="4h", symbol="BTCUSDT")],
+            "1d":  [self._kline(_ms(0),    T, 100.0, 120.0, 80.0, 110.0, 50000.0,
+                                 interval="1d", symbol="BTCUSDT")],
+        }
+
+        with patch("scanner.d15_final_decision") as mock_d15:
+            mock_d15.return_value = self._d15_ok_result()
+            signals = scanner.generate_signals(
+                symbol="BTCUSDT",
+                klines_5m=klines["5m"], klines_15m=klines["15m"],
+                klines_1h=klines["1h"], klines_4h=klines["4h"], klines_1d=klines["1d"],
+                poll_time_ms=poll_time, existing_signal_ids=set(),
+            )
+            self.assertFalse(mock_d15.called,
+                             "forming 5m candle must not trigger D15")
+            self.assertEqual(len(signals), 0)
+
+    # ------------------------------------------------------------------
+    # 11. PaperSignal fields mapped correctly
+    # ------------------------------------------------------------------
+
+    def test_paper_signal_fields_mapped_correctly(self):
+        """D15 OK result must produce a PaperSignalEvent with correct fields."""
+        from scanner import PaperScanner
+        from unittest.mock import patch
+
+        config = self._make_config(strategy_version="test_v1")
+        scanner = PaperScanner(config)
+        T = _ms(1005)
+        klines = self._klines_all_closed_at_T(T)
+        poll_time = T + _ms(60)
+
+        with patch("scanner.d15_final_decision") as mock_d15:
+            mock_d15.return_value = self._d15_ok_result(
+                direction="LONG", entry=101.0, sl=98.0, tp=104.0,
+                signal_time=T, final_long=73.5, final_short=40.0,
+            )
+            signals = scanner.generate_signals(
+                symbol="BTCUSDT",
+                klines_5m=klines["5m"], klines_15m=klines["15m"],
+                klines_1h=klines["1h"], klines_4h=klines["4h"], klines_1d=klines["1d"],
+                poll_time_ms=poll_time, existing_signal_ids=set(),
+            )
+            self.assertEqual(len(signals), 1)
+            sig = signals[0]
+            # PaperSignalEvent fields.
+            self.assertEqual(sig.event, "signal")
+            self.assertEqual(sig.symbol, "BTCUSDT")
+            self.assertEqual(sig.direction, "LONG")
+            self.assertEqual(sig.signal_time, T,
+                             "signal_time must equal setup close_time T")
+            self.assertEqual(sig.entry, 101.0,
+                             "entry must come from D15 result")
+            self.assertEqual(sig.sl, 98.0,
+                             "sl must come from D15 final_sl")
+            self.assertEqual(sig.tp, 104.0,
+                             "tp must come from D15 take_profit")
+            self.assertEqual(sig.score, 73.5,
+                             "score must equal final_long for LONG")
+            self.assertEqual(sig.timeframe, "5m")
+            self.assertEqual(sig.horizon_ms, config.horizon_ms)
+            self.assertEqual(sig.strategy_version, "test_v1")
+            self.assertEqual(sig.generated_at, poll_time,
+                             "generated_at must equal poll_time_ms")
+            # signal_id uses actual direction and T.
+            expected_id = make_signal_id("BTCUSDT", "LONG", T)
+            self.assertEqual(sig.signal_id, expected_id)
+
+    def test_paper_signal_no_signal_when_d15_rejects(self):
+        """D15 non-OK must produce zero PaperSignalEvents."""
+        from scanner import PaperScanner
+        from unittest.mock import patch
+
+        config = self._make_config()
+        scanner = PaperScanner(config)
+        T = _ms(1005)
+        klines = self._klines_all_closed_at_T(T)
+        poll_time = T + _ms(60)
+
+        with patch("scanner.d15_final_decision") as mock_d15:
+            mock_d15.return_value = self._d15_not_ok_result(status="NO_TRADE")
+            signals = scanner.generate_signals(
+                symbol="BTCUSDT",
+                klines_5m=klines["5m"], klines_15m=klines["15m"],
+                klines_1h=klines["1h"], klines_4h=klines["4h"], klines_1d=klines["1d"],
+                poll_time_ms=poll_time, existing_signal_ids=set(),
+            )
+            self.assertEqual(len(signals), 0)
+            self.assertFalse(mock_d15.called is False)  # D15 WAS called
+
+    # ------------------------------------------------------------------
+    # 12. Duplicate protection uses actual direction
+    # ------------------------------------------------------------------
+
+    def test_duplicate_protection_long(self):
+        """Repeated LONG for same (symbol, T) produces no second signal."""
+        from scanner import PaperScanner
+        from unittest.mock import patch
+
+        config = self._make_config()
+        scanner = PaperScanner(config)
+        T = _ms(1005)
+        klines = self._klines_all_closed_at_T(T)
+        poll_time = T + _ms(60)
+        expected_id = make_signal_id("BTCUSDT", "LONG", T)
+
+        existing_ids = {expected_id}
+        with patch("scanner.d15_final_decision") as mock_d15:
+            mock_d15.return_value = self._d15_ok_result(direction="LONG")
+            signals = scanner.generate_signals(
+                symbol="BTCUSDT",
+                klines_5m=klines["5m"], klines_15m=klines["15m"],
+                klines_1h=klines["1h"], klines_4h=klines["4h"], klines_1d=klines["1d"],
+                poll_time_ms=poll_time, existing_signal_ids=existing_ids,
+            )
+            self.assertEqual(len(signals), 0,
+                             "duplicate LONG must be rejected")
+
+    def test_duplicate_protection_short(self):
+        """Repeated SHORT for same (symbol, T) produces no second signal."""
+        from scanner import PaperScanner
+        from unittest.mock import patch
+
+        config = self._make_config()
+        scanner = PaperScanner(config)
+        T = _ms(2005)
+        klines = self._klines_all_closed_at_T(T, symbol="ETHUSDT")
+        poll_time = T + _ms(60)
+        expected_id = make_signal_id("ETHUSDT", "SHORT", T)
+
+        existing_ids = {expected_id}
+        with patch("scanner.d15_final_decision") as mock_d15:
+            mock_d15.return_value = self._d15_ok_result(direction="SHORT")
+            signals = scanner.generate_signals(
+                symbol="ETHUSDT",
+                klines_5m=klines["5m"], klines_15m=klines["15m"],
+                klines_1h=klines["1h"], klines_4h=klines["4h"], klines_1d=klines["1d"],
+                poll_time_ms=poll_time, existing_signal_ids=existing_ids,
+            )
+            self.assertEqual(len(signals), 0,
+                             "duplicate SHORT must be rejected")
+
+    def test_long_and_short_at_same_T_are_distinct(self):
+        """LONG and SHORT at the same T produce distinct signal_ids."""
+        from scanner import PaperScanner
+        from unittest.mock import patch
+
+        config = self._make_config()
+        scanner = PaperScanner(config)
+        T = _ms(1005)
+        klines_long = self._klines_all_closed_at_T(T, symbol="BTCUSDT")
+        klines_short = self._klines_all_closed_at_T(T, symbol="BTCUSDT")
+        poll_time = T + _ms(60)
+        existing_ids = set()
+
+        # Generate LONG signal first.
+        with patch("scanner.d15_final_decision") as mock_d15:
+            mock_d15.return_value = self._d15_ok_result(direction="LONG")
+            signals_long = scanner.generate_signals(
+                symbol="BTCUSDT",
+                klines_5m=klines_long["5m"], klines_15m=klines_long["15m"],
+                klines_1h=klines_long["1h"], klines_4h=klines_long["4h"],
+                klines_1d=klines_long["1d"],
+                poll_time_ms=poll_time, existing_signal_ids=existing_ids,
+            )
+            self.assertEqual(len(signals_long), 1)
+            long_id = signals_long[0].signal_id
+            existing_ids.add(long_id)
+
+        # Generate SHORT signal at same T — should succeed (different id).
+        with patch("scanner.d15_final_decision") as mock_d15:
+            mock_d15.return_value = self._d15_ok_result(direction="SHORT")
+            signals_short = scanner.generate_signals(
+                symbol="BTCUSDT",
+                klines_5m=klines_short["5m"], klines_15m=klines_short["15m"],
+                klines_1h=klines_short["1h"], klines_4h=klines_short["4h"],
+                klines_1d=klines_short["1d"],
+                poll_time_ms=poll_time, existing_signal_ids=existing_ids,
+            )
+            self.assertEqual(len(signals_short), 1)
+            short_id = signals_short[0].signal_id
+            self.assertNotEqual(long_id, short_id,
+                                 "LONG and SHORT at same T must be distinct ids")
+
+    # ------------------------------------------------------------------
+    # 13. existing_signal_ids is NOT mutated by generate_signals()
+    # ------------------------------------------------------------------
+
+    def test_existing_signal_ids_not_mutated(self):
+        """generate_signals() must not mutate the caller's existing_signal_ids set."""
+        from scanner import PaperScanner
+        from unittest.mock import patch
+
+        config = self._make_config()
+        scanner = PaperScanner(config)
+        T = _ms(1005)
+        klines = self._klines_all_closed_at_T(T)
+        poll_time = T + _ms(60)
+
+        original_ids = {make_signal_id("OTHER", "LONG", _ms(999))}
+        ids_before = set(original_ids)
+
+        with patch("scanner.d15_final_decision") as mock_d15:
+            mock_d15.return_value = self._d15_ok_result(direction="LONG")
+            scanner.generate_signals(
+                symbol="BTCUSDT",
+                klines_5m=klines["5m"], klines_15m=klines["15m"],
+                klines_1h=klines["1h"], klines_4h=klines["4h"], klines_1d=klines["1d"],
+                poll_time_ms=poll_time, existing_signal_ids=original_ids,
+            )
+            self.assertEqual(original_ids, ids_before,
+                             "existing_signal_ids must not be mutated")
+
+    # ------------------------------------------------------------------
+    # 14. Empty closed 5m returns no signal and does not call D15
+    # ------------------------------------------------------------------
+
+    def test_no_closed_5m_returns_no_signal_no_d15_call(self):
+        """When closed_5m is empty, D15 is not called and no signal is returned."""
+        from scanner import PaperScanner
+        from unittest.mock import patch
+
+        config = self._make_config()
+        scanner = PaperScanner(config)
+        poll_time = _ms(1000)
+
+        # All 5m klines are forming (close_time > cutoff).
+        forming_5m = [self._kline(_ms(1000), poll_time + _ms(300),
+                                   100.0, 101.0, 99.0, 101.0, 1000.0,
+                                   interval="5m", symbol="BTCUSDT")]
+        higher_tfs = {
+            "15m": [self._kline(_ms(1000), _ms(1000), 100.0, 102.0, 98.0, 101.0, 2000.0,
+                                 interval="15m", symbol="BTCUSDT")],
+            "1h":  [self._kline(_ms(1000), _ms(1000), 100.0, 105.0, 95.0, 102.0, 5000.0,
+                                 interval="1h", symbol="BTCUSDT")],
+            "4h":  [self._kline(_ms(1000), _ms(1000), 100.0, 110.0, 90.0, 105.0, 10000.0,
+                                 interval="4h", symbol="BTCUSDT")],
+            "1d":  [self._kline(_ms(0),    _ms(1000), 100.0, 120.0, 80.0, 110.0, 50000.0,
+                                 interval="1d", symbol="BTCUSDT")],
+        }
+
+        with patch("scanner.d15_final_decision") as mock_d15:
+            mock_d15.return_value = self._d15_ok_result()
+            signals = scanner.generate_signals(
+                symbol="BTCUSDT",
+                klines_5m=forming_5m, klines_15m=higher_tfs["15m"],
+                klines_1h=higher_tfs["1h"], klines_4h=higher_tfs["4h"],
+                klines_1d=higher_tfs["1d"],
+                poll_time_ms=poll_time, existing_signal_ids=set(),
+            )
+            self.assertFalse(mock_d15.called,
+                             "empty closed_5m must not call D15")
+            self.assertEqual(len(signals), 0)
+
+    # ------------------------------------------------------------------
+    # 15. Kline→dict conversion verified
+    # ------------------------------------------------------------------
+
+    def test_kline_to_dict_format(self):
+        """Each Kline must be converted to a dict with all 7 required fields."""
+        from scanner import PaperScanner
+        from unittest.mock import patch
+
+        config = self._make_config()
+        scanner = PaperScanner(config)
+        T = _ms(1005)
+        klines = self._klines_all_closed_at_T(T)
+        poll_time = T + _ms(60)
+
+        # We inspect what D15 receives by capturing the call.
+        with patch("scanner.d15_final_decision") as mock_d15:
+            mock_d15.return_value = self._d15_ok_result()
+            scanner.generate_signals(
+                symbol="BTCUSDT",
+                klines_5m=klines["5m"], klines_15m=klines["15m"],
+                klines_1h=klines["1h"], klines_4h=klines["4h"], klines_1d=klines["1d"],
+                poll_time_ms=poll_time, existing_signal_ids=set(),
+            )
+            call_kwargs = mock_d15.call_args.kwargs
+            for tf in ("5m", "15m", "1h", "4h", "1d"):
+                candles = call_kwargs["candles_by_tf"][tf]
+                self.assertTrue(len(candles) >= 1,
+                                f"{tf} must have at least one candle")
+                c = candles[0]
+                for key in ("open_time", "close_time", "open", "high", "low",
+                            "close", "volume"):
+                    self.assertIn(key, c,
+                                  f"{tf} candle dict missing key '{key}'")
+                # Verify no future fields leak in.
+                self.assertEqual(set(c.keys()),
+                                 {"open_time", "close_time", "open", "high",
+                                  "low", "close", "volume"})
+
+
 class TestP5CLI(unittest.TestCase):
     """CLI argument parsing."""
 
