@@ -152,6 +152,23 @@ class ExecutionLedger:
         """Log an order_result event."""
         return self.append(result)
 
+    def log_cancel_result(self, result: CancelResult) -> int:
+        """Log a cancel_result event."""
+        from execution.demo_cancel import CancelResult as _CancelResult
+
+        record = {
+            "event": "cancel_result",
+            "symbol": result.symbol,
+            "side": result.side,
+            "status": result.status,
+            "order_id": result.order_id,
+            "client_order_id": result.client_order_id,
+            "message": result.message,
+            "executed_at_ms": result.executed_at_ms,
+            "error_code": result.error_code,
+        }
+        return self.append_dict(record)
+
     def log_error(
         self,
         signal_id: str = "",
