@@ -456,3 +456,51 @@ class TestRestartDuplicateProtection:
 if __name__ == "__main__":
     import pytest
     pytest.main([__file__, "-v"])
+
+# ── P6: Missing / empty signal ledger handling ───────────────────────
+
+class TestMissingOrEmptyLedger:
+    def test_dry_run_missing_ledger_empty_result_no_post(self):
+        _env_setup(DEMO_AUTO_TRADE="true")
+        with patch('execution.demo_orders.place_limit_order') as mock_place:
+            result = main(["--log", "data/signals/nonexistent_ledger.jsonl", "--dry-run"])
+            assert result == 0
+            mock_place.assert_not_called()
+        _env_clear()
+
+    def test_dry_run_empty_ledger_empty_result_no_post(self):
+        _env_setup(DEMO_AUTO_TRADE="true")
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.jsonl', delete=False) as f:
+            path = f.name
+        try:
+            with patch('execution.demo_orders.place_limit_order') as mock_place:
+                result = main(["--log", path, "--dry-run"])
+                assert result == 0
+                mock_place.assert_not_called()
+        finally:
+            if os.path.exists(path):
+                os.unlink(path)
+        _env_clear()
+
+    def test_non_dry_run_missing_ledger_fails_closed_no_post(self):
+        _env_setup(DEMO_AUTO_TRADE="true")
+        with patch('execution.demo_orders.place_limit_order') as mock_place:
+            result = main(["--log", "data/signals/nonexistent_ledger.jsonl"])
+            assert result == 1
+            mock_place.assert_not_called()
+        _env_clear()
+
+    def test_malformed_ledger_fails_closed(self):
+        _env_setup(DEMO_AUTO_TRADE="true")
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.jsonl', delete=False) as f:
+            f.write("NOT VALID JSON{{{")
+            path = f.name
+        try:
+            with patch('execution.demo_orders.place_limit_order') as mock_place:
+                result = main(["--log", path])
+                assert result == 1
+                mock_place.assert_not_called()
+        finally:
+            if os.path.exists(path):
+                os.unlink(path)
+        _env_clear()

@@ -347,25 +347,44 @@ def main(args=None) -> int:
 
     # Load D15 signals from the log file
     signal_path = args.log
-    if not os.path.exists(signal_path):
-        print(f"FAIL: Signal log not found at {signal_path}", file=sys.stderr)
-        return 1
-
-    signals = []
-    with open(signal_path, "r") as f:
-        for line_num, line in enumerate(f, 1):
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                signal = json.loads(line)
-                signals.append(signal)
-            except json.JSONDecodeError as e:
-                print(f"WARN: Invalid JSON at line {line_num}: {e}", file=sys.stderr)
-
-    if not signals:
-        print("No signals found in log file", file=sys.stderr)
-        return 0  # No action needed
+    if args.dry_run:
+        if not os.path.exists(signal_path):
+            print("[DRY-RUN] No signal ledger found; treating as empty set (0 signals)")
+            signals = []
+        else:
+            signals = []
+            with open(signal_path, "r") as f:
+                for line_num, line in enumerate(f, 1):
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        signal = json.loads(line)
+                        signals.append(signal)
+                    except json.JSONDecodeError as e:
+                        print(f"WARN: Invalid JSON at line {line_num}: {e}", file=sys.stderr)
+        if not signals:
+            print("Processed 0 signals, validated 0, submitted 0 orders (dry-run, empty/missing ledger)")
+            return 0
+    else:
+        if not os.path.exists(signal_path):
+            print(f"FAIL: Signal log not found at {signal_path}", file=sys.stderr)
+            return 1
+        signals = []
+        with open(signal_path, "r") as f:
+            for line_num, line in enumerate(f, 1):
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    signal = json.loads(line)
+                    signals.append(signal)
+                except json.JSONDecodeError as e:
+                    print(f"FAIL: Malformed signal ledger at line {line_num}: {e}", file=sys.stderr)
+                    return 1
+        if not signals:
+            print("FAIL: Signal log is empty; no executions permitted", file=sys.stderr)
+            return 1
 
     processed_count = 0
     submitted_count = 0
