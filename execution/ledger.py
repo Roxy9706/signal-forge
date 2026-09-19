@@ -68,6 +68,14 @@ class ExecutionLedger:
         all_events = self.read_all()
         return [e for e in all_events if e.get("signal_id") == signal_id]
 
+    def get_events_by_signal_id(self, signal_id: str) -> List[Dict[str, Any]]:
+        return self.find_by_signal_id(signal_id)
+
+    def get_pending_orders(self) -> List[Dict[str, Any]]:
+        """Return events representing pending/open orders."""
+        events = self.read_all()
+        return [e for e in events if e.get("event") in ("order_submitted", "order_accepted")]
+
     def count(self, event_type: Optional[str] = None) -> int:
         """Count events, optionally filtered by type."""
         records = self.read_all()
