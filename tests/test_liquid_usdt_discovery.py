@@ -780,6 +780,139 @@ class TestPaperObserverIntegration(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
+# cmd_paper default/mode tests
+# ---------------------------------------------------------------------------
+# Deterministic tests for the cmd_paper() argument-handling logic.
+# All Binance HTTP calls are mocked via _FakeUrlopen (no live network).
+# Covers:
+#   - no --symbols  => auto-discovery is the default
+#   - --symbols     => manual mode, discovery skipped
+#   - discovery failure => fatal (sys.exit)
+#   - empty discovery  => fatal (sys.exit)
+#   - --auto-discover flag still accepted (backward compat)
+
+
+class TestCmdPaperDefaultMode(unittest.TestCase):
+    """cmd_paper() argument-handling: defaults and manual override."""
+
+    def setUp(self):
+        self._fake = _FakeUrlopen()
+        self._fake.install()
+        # Canned exchangeInfo + ticker that yield a small liquid set.
+        self._liquid_symbols = ["BTCUSDT", "ETHUSDT", "SOLUSDT"]
+        self._fake.set_responses([
+            _exchange_info([
+                {"symbol": "BTCUSDT", "status": "TRADING", "quoteAsset": "USDT", "underlyingType": "COIN"},
+                {"symbol": "ETHUSDT", "status": "TRADING", "quoteAsset": "USDT", "underlyingType": "COIN"},
+                {"symbol": "SOLUSDT", "status": "TRADING", "quoteAsset": "USDT", "underlyingType": "COIN"},
+                {"symbol": "BNBUSDT", "status": "TRADING", "quoteAsset": "USDT", "underlyingType": "COIN"},
+            ]),
+            _ticker_all([
+                _make_ticker("BTCUSDT", 150_000_000),
+                _make_ticker("ETHUSDT", 120_000_000),
+                _make_ticker("SOLUSDT", 60_000_000),
+                _make_ticker("BNBUSDT", 40_000_000),  # below threshold -> excluded
+            ]),
+        ])
+
+    def tearDown(self):
+        self._fake.uninstall()
+
+    def _parse_args(self, argv: List[str]) -> Any:
+        from scanner import build_parser
+        parser = build_parser()
+        # Always cap cycles to 0 so cmd_paper exits the observer loop
+        # immediately instead of hanging the test.
+        if "--max-cycles" not in argv:
+            argv = argv + ["--max-cycles", "0"]
+        return parser.parse_args(argv)
+
+    def _run_cmd_paper(self, args: Any) -> None:
+        from scanner import cmd_paper
+        # sys.exit is called on fatal paths; catch SystemExit.
+        try:
+            cmd_paper(args)
+        except SystemExit as exc:
+            raise exc
+
+    def test_no_symbols_defaults_to_discovery(self):
+        """python scanner.py paper  -> auto-discovery runs (no --symbols)."""
+        args = self._parse_args(["paper"])
+        self.assertIsNone(args.symbols)
+        self.assertFalse(args.auto_discover)
+        # This must succeed (discovery returns symbols).
+        try:
+            self._run_cmd_paper(args)
+        except SystemExit:
+            self.fail("cmd_paper with no --symbols should succeed via auto-discovery")
+        # The fake recorded 2 Binance calls: exchangeInfo + ticker/24hr.
+        self.assertEqual(len(self._fake.urls), 2)
+        self.assertTrue(any("exchangeInfo" in u for u in self._fake.urls))
+        self.assertTrue(any("ticker/24hr" in u for u in self._fake.urls))
+
+    def test_symbols_supplied_skips_discovery(self):
+        """python scanner.py paper --symbols BTCUSDT ETHUSDT -> no HTTP calls."""
+        self._fake.set_responses([])  # no responses -> any HTTP call would raise
+        args = self._parse_args(["paper", "--symbols", "BTCUSDT", "ETHUSDT"])
+        self.assertEqual(args.symbols, ["BTCUSDT", "ETHUSDT"])
+        # Should NOT trigger any discovery; should print manual list and proceed.
+        try:
+            self._run_cmd_paper(args)
+        except SystemExit:
+            self.fail("cmd_paper with --symbols should not call discovery")
+        # No HTTP calls made (discovery skipped).
+        self.assertEqual(len(self._fake.urls), 0)
+
+    def test_discovery_failure_is_fatal(self):
+        """Failed auto-discovery -> sys.exit(1), no fallback."""
+        self._fake.set_responses([urllib.error.URLError("network down")])
+        args = self._parse_args(["paper"])
+        with self.assertRaises(SystemExit) as ctx:
+            self._run_cmd_paper(args)
+        self.assertEqual(ctx.exception.code, 1)
+
+    def test_empty_discovery_is_fatal(self):
+        """Auto-discovery returning 0 symbols -> sys.exit(1)."""
+        # ExchangeInfo with only a sub-threshold symbol + ticker confirming it.
+        self._fake.set_responses([
+            _exchange_info([
+                {"symbol": "BNBUSDT", "status": "TRADING", "quoteAsset": "USDT", "underlyingType": "COIN"},
+            ]),
+            _ticker_all([
+                _make_ticker("BNBUSDT", 10_000_000),  # below 50M threshold
+            ]),
+        ])
+        args = self._parse_args(["paper"])
+        with self.assertRaises(SystemExit) as ctx:
+            self._run_cmd_paper(args)
+        self.assertEqual(ctx.exception.code, 1)
+
+    def test_auto_discover_flag_still_accepted(self):
+        """--auto-discover is backward-compatible; identical to default behaviour."""
+        args = self._parse_args(["paper", "--auto-discover"])
+        self.assertTrue(args.auto_discover)
+        # With --symbols absent, the new logic still auto-discovers (flag ignored).
+        try:
+            self._run_cmd_paper(args)
+        except SystemExit:
+            self.fail("--auto-discover with no --symbols should still auto-discover")
+        self.assertEqual(len(self._fake.urls), 2)
+
+    def test_symbols_overrides_auto_discover_flag(self):
+        """When both --symbols and --auto-discover are given, --symbols wins."""
+        self._fake.set_responses([])  # any HTTP call would raise
+        args = self._parse_args(["paper", "--symbols", "BTCUSDT", "--auto-discover"])
+        self.assertEqual(args.symbols, ["BTCUSDT"])
+        self.assertTrue(args.auto_discover)
+        # Manual symbols take precedence; no discovery HTTP calls.
+        try:
+            self._run_cmd_paper(args)
+        except SystemExit:
+            self.fail("--symbols should win over --auto-discover")
+        self.assertEqual(len(self._fake.urls), 0)
+
+
+# ---------------------------------------------------------------------------
 # Run
 # ---------------------------------------------------------------------------
 

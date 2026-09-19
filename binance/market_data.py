@@ -324,7 +324,9 @@ class BinancePublicClient:
 
     def _build_url(self, path: str, params: Optional[Dict[str, Any]] = None) -> str:
         """Build a full API URL with query parameters."""
-        url = f"{self._base_url}{path}"
+        base = self._base_url.rstrip("/")
+        path = path.lstrip("/")
+        url = f"{base}/{path}"
         if params:
             query = urllib.parse.urlencode(params)
             url = f"{url}?{query}"
@@ -364,7 +366,7 @@ class BinancePublicClient:
                 status = e.code
                 if status == 429:
                     # Rate limit — read Retry-After if present
-                    retry_after = e.headers.get("Retry-After")
+                    retry_after = getattr(e, "headers", {}).get("Retry-After")
                     wait = (
                         float(retry_after) if retry_after
                         else self.backoff_base_sec * (2 ** (attempt - 1))

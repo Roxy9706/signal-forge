@@ -4,7 +4,7 @@
 # NO leverage, NO Telegram/webhooks, NO auto-trading.
 #
 # Architecture:
-#   Binance public klines → closed-candle filter → MTF alignment → scanner
+#   Binance public klines / auto-discovery → closed-candle filter → MTF alignment → scanner
 #   → paper signal → JSONL log (source of truth) → paper evaluator (P3)
 #   → outcome event → JSONL log → CLI/summary
 #
@@ -15,6 +15,15 @@
 #             AND no TP/SL hit. NOT when data is insufficient.
 # State: JSONL is authoritative. State cache is disposable/rebuildable.
 # State keying: per (symbol, timeframe), NOT global timestamp.
+#
+# Auto-discovery (P5 USDⓈ-M liquid pair discovery):
+#   Uses Binance public market data only:
+#     GET fapi.binance.com/fapi/v1/exchangeInfo  → status, quoteAsset
+#     GET fapi.binance.com/fapi/v1/ticker/24hr  → 24h quoteVolume
+#   Filters: status==TRADING, quoteAsset==USDT, not excluded, not leveraged,
+#            24h quoteVolume >= 50,000,000 USDT (existing frozen threshold).
+#   No private endpoints, no API keys, no orders, no execution, paper-only.
+
 
 
 from __future__ import annotations
@@ -682,8 +691,9 @@ def build_parser() -> argparse.ArgumentParser:
     paper_parser.add_argument(
         "--symbols",
         nargs="+",
-        default=["BTCUSDT", "ETHUSDT"],
-        help="Symbols to observe (default: BTCUSDT ETHUSDT)",
+        default=None,
+        help="Manual symbol list (e.g. BTCUSDT ETHUSDT). When supplied, "
+             "auto-discovery is skipped and these symbols are used directly.",
     )
     paper_parser.add_argument(
         "--interval",
@@ -702,6 +712,13 @@ def build_parser() -> argparse.ArgumentParser:
         type=str,
         default="data/signals/paper_trade.jsonl",
         help="JSONL log path (default: data/signals/paper_trade.jsonl)",
+    )
+    paper_parser.add_argument(
+        "--auto-discover",
+        action="store_true",
+        default=False,
+        help="Explicitly request auto-discovery (same as the default when "
+             "--symbols is not supplied). Provided for backward compatibility.",
     )
 
     # --show-open
@@ -755,8 +772,53 @@ def build_parser() -> argparse.ArgumentParser:
 
 def cmd_paper(args) -> None:
     """Run the paper observation loop."""
+    from binance.contracts import discover_liquid_usdt_symbols
+
+    if args.symbols:
+        # Explicit manual symbol list — skip auto-discovery.
+        # Cap at MAX_SYMBOLS as a safety measure.
+        final_symbols = args.symbols[:MAX_SYMBOLS]
+        print(f"[P5] Using manual symbol list ({len(final_symbols)} symbols): "
+              f"{', '.join(final_symbols)}")
+    else:
+        # Default: auto-discover liquid USDT-M pairs from Binance public data.
+        # Failure here is fatal: we do NOT silently fall back to a hardcoded
+        # list.  If discovery cannot be done we stop rather than silently
+        # paper-trading a stale manual list.
+        print("[P5] Auto-discovering active/liquid USDT-M pairs …")
+        client = BinancePublicClient(
+            timeout_sec=10,
+            max_retries=5,
+            backoff_base_sec=2,
+        )
+        try:
+            symbols = discover_liquid_usdt_symbols(
+                client,
+                max_symbols=MAX_SYMBOLS,
+            )
+        except Exception as e:
+            print(f"[P5] FATAL: symbol auto-discovery failed: {e}", file=sys.stderr)
+            print("[P5] No fallback to manual symbol list — aborting.", file=sys.stderr)
+            sys.exit(1)
+
+        if not symbols:
+            print("[P5] Auto-discovery succeeded but returned 0 liquid symbols. "
+                  "Nothing to observe — aborting.", file=sys.stderr)
+            sys.exit(1)
+
+        print(f"[P5] Auto-discovered {len(symbols)} liquid USDT-M symbols: "
+              f"{', '.join(symbols)}")
+        # discover_liquid_usdt_symbols already caps at max_symbols internally;
+        # no additional slice needed here.
+        final_symbols = symbols
+
+    if not final_symbols:
+        print("[P5] No symbols to observe.  Use --symbols to supply a manual "
+              "list, or ensure auto-discovery can reach Binance.", file=sys.stderr)
+        sys.exit(1)
+
     config = P5Config(
-        symbols=args.symbols[:MAX_SYMBOLS],
+        symbols=final_symbols,
         poll_interval_sec=args.interval,
         log_path=args.log,
         strategy_version=make_strategy_version(),
