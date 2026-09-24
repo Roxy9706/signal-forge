@@ -178,7 +178,13 @@ class TestValidLongRejection(unittest.TestCase):
         )
         self.assertFalse(validate_pullback_long(series, 20, 101.5))
 
-    def test_low_breaks_below_L(self):
+    def test_low_breaks_below_L_allowed(self):
+        """Wick penetration below L is now allowed by D7 (no_break removed).
+
+        Regression: the old exact-equality degeneracy required low(C) >= L.
+        With the approved spec, a LONG setup candle whose low breaks below L
+        but closes back above L with a bullish body is a valid D7 event.
+        """
         series = _build_with_setup(
             1000000,
             [102.0] * 19 + [102.5],
@@ -187,7 +193,9 @@ class TestValidLongRejection(unittest.TestCase):
             [102.0] * 19 + [102.6],
             101.0, 102.5, 101.0, 102.2,
         )
-        self.assertFalse(validate_pullback_long(series, 20, 101.5))
+        # L = 101.5. Setup: low=101.0 < L (penetrates), close=102.2 > L,
+        # body bullish (102.2 > 101.0). This is now a valid D7 LONG event.
+        self.assertTrue(validate_pullback_long(series, 20, 101.5))
 
     def test_high_does_not_reach_L(self):
         series = _build_with_setup(
@@ -299,8 +307,7 @@ class TestFullD7Gate(unittest.TestCase):
         # L = 100.26.
         # Prior candle at index 18 has close=103.0 > L=100.26 ✓ pullback.
         # Setup candle: low=100.26 = L ✓ tested, close=102.2 > L ✓ closed_back,
-        #   close(102.2) > open(101.0) ✓ body_bullish,
-        #   low(100.26) >= L(100.26) ✓ no_break_below.
+        #   close(102.2) > open(101.0) ✓ body_bullish.
         series = _build_with_setup(
             1000000,
             [100.0] * 18 + [103.0],   # 18 prior close=100.0, 1 prior close=103.0
@@ -322,8 +329,7 @@ class TestFullD7Gate(unittest.TestCase):
         # L = 100.65.
         # Prior candle at index 18 has close=97.0 < L=100.65 ✓ pullback.
         # Setup candle: high=100.65 = L ✓ tested, close=98.0 < L ✓ closed_back,
-        #   close(98.0) < open(99.5) ✓ body_bearish,
-        #   high(100.65) <= L(100.65) ✓ no_break_above.
+        #   close(98.0) < open(99.5) ✓ body_bearish.
         series = _build_with_setup(
             1000000,
             [101.0] * 18 + [97.0],
@@ -381,10 +387,9 @@ class TestFullD7Gate(unittest.TestCase):
         # Most recent swing low = idx 13, low=96.0. L=96.0.
         # Prior candle with close > 96.0: many exist (e.g. idx 17 close=99.0).
         # Setup candle: open=97.0, high=102.5, low=96.0 (=L, touches), close=98.5 (>L).
-        #   tested: low(96.0) <= 96.0 AND high(102.5) >= 96.0 → True ✓
+        #   tested: low(96.0) <= 96.0 ✓ (LONG: low <= L)
         #   closed_back: close(98.5) > 96.0 → True ✓
         #   body_bullish: close(98.5) > open(97.0) → True ✓
-        #   no_break_below: low(96.0) >= 96.0 → True ✓
         series.append(_k(1000000 + 18 * 300000, 97.0, 102.5, 96.0, 98.5))
         self.assertTrue(d7_pullback_pass(series, 18, 'LONG'))
 
@@ -409,10 +414,9 @@ class TestFullD7Gate(unittest.TestCase):
         # Most recent swing high = idx 12, high=99.0. L=99.0.
         # Setup candle at index 18: tests L, closes below L.
         #   open=96.5, high=99.0 (=L, touches), low=96.0, close=96.2 (<L).
-        #   tested: low(96.0) <= 99.0 AND high(99.0) >= 99.0 → True ✓
+        #   tested: high(99.0) >= 99.0 ✓ (SHORT: high >= L)
         #   closed_back: close(96.2) < 99.0 → True ✓
         #   body_bearish: close(96.2) < open(96.5) → True ✓
-        #   no_break_above: high(99.0) <= 99.0 → True ✓
         # Prior candle with close < 99.0: many exist (e.g. idx 17 close=97.0).
         series.append(_k(1000000 + 18 * 300000, 96.5, 99.0, 96.0, 96.2))
         self.assertTrue(d7_pullback_pass(series, 18, 'SHORT'))

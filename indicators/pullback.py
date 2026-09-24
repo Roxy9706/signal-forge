@@ -112,10 +112,9 @@ def validate_pullback_long(
       - L exists
       - pullback exists: most recent candle in W with close > L
       - rejection confirmed:
-          tested:       low(C) <= L AND high(C) >= L
+          tested:       low(C) <= L
           closed_back:  close(C) > L   (STRICT — equality invalid)
           body_bullish: close(C) > open(C)
-          no_break_below: low(C) >= L   (opposing wick may TOUCH L, not break)
 
     Args:
         candles_5m: closed 5m candles sorted ascending by close_time.
@@ -137,12 +136,11 @@ def validate_pullback_long(
     if not pullback:
         return False
 
-    tested = (C['low'] <= L) and (C['high'] >= L)
+    tested = (C['low'] <= L)
     closed_back = C['close'] > L
     body_bullish = C['close'] > C['open']
-    no_break_below = C['low'] >= L
 
-    rejection = tested and closed_back and body_bullish and no_break_below
+    rejection = tested and closed_back and body_bullish
     return rejection
 
 
@@ -157,10 +155,9 @@ def validate_pullback_short(
       - L exists
       - pullback exists: most recent candle in W with close < L
       - rejection confirmed:
-          tested:       low(C) <= L AND high(C) >= L
+          tested:       high(C) >= L
           closed_back:  close(C) < L   (STRICT — equality invalid)
           body_bearish: close(C) < open(C)
-          no_break_above: high(C) <= L  (opposing wick may TOUCH L, not break)
 
     Args:
         candles_5m: closed 5m candles sorted ascending by close_time.
@@ -182,12 +179,11 @@ def validate_pullback_short(
     if not pullback:
         return False
 
-    tested = (C['low'] <= L) and (C['high'] >= L)
+    tested = (C['high'] >= L)
     closed_back = C['close'] < L
     body_bearish = C['close'] < C['open']
-    no_break_above = C['high'] <= L
 
-    rejection = tested and closed_back and body_bearish and no_break_above
+    rejection = tested and closed_back and body_bearish
     return rejection
 
 
