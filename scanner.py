@@ -32,6 +32,7 @@ import sys
 import json
 import hashlib
 import argparse
+import concurrent.futures
 import datetime
 from typing import Any, Dict, List, Optional, Tuple, Iterable
 from dataclasses import dataclass, field
@@ -83,12 +84,28 @@ from indicators.d15_decision import d15_final_decision
 # P5 Configuration
 # ---------------------------------------------------------------------------
 
+# Hard cap on symbol-level fetch concurrency (validated benchmark: c=2).
+# Values above this are clamped/fail-closed — never spawn more workers.
+MAX_FETCH_CONCURRENCY = 2
+
+# Cap for the AUTO-DISCOVERY universe only (approved expansion; validated
+# with the real production run_once path at 74 symbols: 140.7s/cycle,
+# 0×429, peak weight 932/2400, 53% headroom before the 300s boundary).
+# The manual --symbols safety slice stays governed by MAX_SYMBOLS = 10
+# (imported from binance.market_data) and is NOT affected by this value.
+AUTO_DISCOVERY_MAX_SYMBOLS = 75
+
+
 @dataclass
 class P5Config:
     """P5 paper observation configuration."""
     # Symbol universe
     symbols: List[str] = field(default_factory=lambda: ["BTCUSDT", "ETHUSDT"])
     max_symbols: int = MAX_SYMBOLS
+
+    # Fetch orchestration (symbol-level only; timeframe fetches inside
+    # poll_symbol stay sequential; D15/ledger/evaluation stay single-threaded)
+    fetch_concurrency: int = MAX_FETCH_CONCURRENCY
 
     # Polling
     poll_interval_sec: int = DEFAULT_POLL_INTERVAL_SEC  # 5 minutes default
@@ -573,16 +590,47 @@ class PaperObserver:
         existing_ids = set(all_signal_ids)
         open_events = self.get_open_signal_events()
 
-        # Check open signal count safety
+        # Circuit breaker: intentionally independent of the expanded
+        # auto-discovery universe (AUTO_DISCOVERY_MAX_SYMBOLS=75).  A wider
+        # universe raises the odds of reaching it; exceeding 50 open signals
+        # fails the cycle CLOSED (no processing), by design.
         if len(open_events) > self.config.max_open_signals:
             summary["errors"]["too_many_open"] = f"open signals ({len(open_events)}) exceed max ({self.config.max_open_signals})"
             return summary
 
-        for symbol in self.config.symbols:
-            summary["symbols_processed"] += 1
+        # ------------------------------------------------------------------
+        # Phase 1 — FETCH (symbol-level bounded concurrency, GET-only).
+        # poll_symbol itself is UNCHANGED: inside each symbol the 5 timeframe
+        # requests remain strictly sequential.  Only independent symbols run
+        # in parallel, hard-capped at MAX_FETCH_CONCURRENCY (=2, benchmark
+        # validated).  fetch_concurrency <= 1 preserves exactly sequential
+        # behavior.  Invalid (>2) values fail closed to the cap — never more.
+        # ------------------------------------------------------------------
+        workers = self.config.fetch_concurrency
+        if not isinstance(workers, int) or isinstance(workers, bool) or workers < 1:
+            workers = 1
+        workers = min(workers, MAX_FETCH_CONCURRENCY)
 
-            # Fetch klines
-            klines_5m, klines_15m, klines_1h, klines_4h, klines_1d, poll_ts, error = self.poll_symbol(symbol)
+        fetch_results: List[Tuple] = []
+        if workers <= 1:
+            for symbol in self.config.symbols:
+                fetch_results.append(self.poll_symbol(symbol))
+        else:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
+                # list(pool.map(...)) preserves config.symbols order regardless
+                # of completion order; poll_symbol already converts per-TF
+                # fetch exceptions into (empty klines, error_type) tuples.
+                fetch_results = list(pool.map(self.poll_symbol, self.config.symbols))
+
+        # ------------------------------------------------------------------
+        # Phase 2 — PROCESS strictly sequentially in config.symbols order.
+        # D15, staleness checks, open-signal evaluation, duplicate suppression
+        # and JSONL writes all remain single-threaded with identical semantics
+        # to the historical sequential loop.
+        # ------------------------------------------------------------------
+        for symbol, (klines_5m, klines_15m, klines_1h, klines_4h, klines_1d,
+                     poll_ts, error) in zip(self.config.symbols, fetch_results):
+            summary["symbols_processed"] += 1
 
             if error:
                 summary["errors"][symbol] = error
@@ -794,7 +842,7 @@ def cmd_paper(args) -> None:
         try:
             symbols = discover_liquid_usdt_symbols(
                 client,
-                max_symbols=MAX_SYMBOLS,
+                max_symbols=AUTO_DISCOVERY_MAX_SYMBOLS,
             )
         except Exception as e:
             print(f"[P5] FATAL: symbol auto-discovery failed: {e}", file=sys.stderr)

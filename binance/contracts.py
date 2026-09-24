@@ -125,7 +125,12 @@ def _passes_exchange_info_filters(sym_info: Dict[str, Any]) -> bool:
     Filters:
     - status == "TRADING"
     - quoteAsset == "USDT"
-    - underlyingType == "COIN" (missing → rejected, fail closed)
+    - contractType == "PERPETUAL" (authoritative perpetual test;
+      missing / CURRENT_QUARTER / NEXT_QUARTER / TRADIFI_PERPETUAL →
+      rejected, fail closed)
+    - underlyingType == "COIN" (secondary guard: hard-rejects INDEX-style
+      products such as BTCDOMUSDT / ALLUSDT, EQUITY, and missing values —
+      fail closed)
     - symbol not in DEFAULT_EXCLUDE
     - symbol ends with "USDT" and base not a leveraged token (UP/DOWN)
     - len(symbol) > 4
@@ -143,6 +148,8 @@ def _passes_exchange_info_filters(sym_info: Dict[str, Any]) -> bool:
     if sym_info.get("status") != "TRADING":
         return False
     if sym_info.get("quoteAsset") != "USDT":
+        return False
+    if sym_info.get("contractType") != "PERPETUAL":
         return False
     if sym_info.get("underlyingType") != "COIN":
         return False

@@ -96,7 +96,10 @@ class ExecutionConfig:
 
         Args:
             symbol_allowlist: optional explicit allowlist. If None, defaults to
-                BTCUSDT, ETHUSDT, SOLUSDT (the current D8-D15 scan universe).
+                BTCUSDT, ETHUSDT, SOLUSDT — a fixed execution allowlist, NOT
+                the observation universe (paper auto-discovery may scan up to
+                scanner.AUTO_DISCOVERY_MAX_SYMBOLS symbols; signals outside
+                this allowlist are fail-closed rejected at execution).
             max_position_quantity: maximum position quantity per order.
             max_total_exposure_usd: maximum total notional exposure across all positions.
             min_rr: minimum risk:reward ratio required for any order (default 2.0).

@@ -189,16 +189,16 @@ class TestBuildSymbolUniversePreserved(unittest.TestCase):
         self.assertTrue(all(is_valid_symbol(s) for s in u))
 
     def test_capped(self):
-        huge = [{"symbol": f"S{i}USDT", "status": "TRADING", "quoteAsset": "USDT", "underlyingType": "COIN"}
+        huge = [{"symbol": f"S{i}USDT", "status": "TRADING", "quoteAsset": "USDT", "contractType": "PERPETUAL", "underlyingType": "COIN"}
                 for i in range(100)]
         u = build_symbol_universe(from_exchange_info=huge, max_symbols=7)
         self.assertEqual(len(u), 7)
 
     def test_sorted(self):
         eqs = [
-            {"symbol": "ZZZUSDT", "status": "TRADING", "quoteAsset": "USDT", "underlyingType": "COIN"},
-            {"symbol": "AAAUSDT", "status": "TRADING", "quoteAsset": "USDT", "underlyingType": "COIN"},
-            {"symbol": "MMMUSDT", "status": "TRADING", "quoteAsset": "USDT", "underlyingType": "COIN"},
+            {"symbol": "ZZZUSDT", "status": "TRADING", "quoteAsset": "USDT", "contractType": "PERPETUAL", "underlyingType": "COIN"},
+            {"symbol": "AAAUSDT", "status": "TRADING", "quoteAsset": "USDT", "contractType": "PERPETUAL", "underlyingType": "COIN"},
+            {"symbol": "MMMUSDT", "status": "TRADING", "quoteAsset": "USDT", "contractType": "PERPETUAL", "underlyingType": "COIN"},
         ]
         u = build_symbol_universe(from_exchange_info=eqs)
         self.assertEqual(u, ["AAAUSDT", "MMMUSDT", "ZZZUSDT"])
@@ -207,16 +207,81 @@ class TestBuildSymbolUniversePreserved(unittest.TestCase):
 class TestPassesExchangeInfoFilters(unittest.TestCase):
     """Direct unit-test of the exchangeInfo filtering predicate."""
 
-    def _sym(self, symbol, status="TRADING", quoteAsset="USDT", underlyingType="COIN", **extra) -> Dict[str, Any]:
-        d: Dict[str, Any] = {"symbol": symbol, "status": status, "quoteAsset": quoteAsset, "underlyingType": underlyingType}
+    def _sym(self, symbol, status="TRADING", quoteAsset="USDT", underlyingType="COIN",
+             contractType="PERPETUAL", **extra) -> Dict[str, Any]:
+        d: Dict[str, Any] = {"symbol": symbol, "status": status, "quoteAsset": quoteAsset,
+                             "contractType": contractType, "underlyingType": underlyingType}
         d.update(extra)
         return d
+
+    def test_trading_usdt_perpetual_accept(self):
+        """Regression 1: TRADING + USDT + PERPETUAL qualifies."""
+        self.assertTrue(
+            __import__("binance.contracts", fromlist=["_passes_exchange_info_filters"])
+            ._passes_exchange_info_filters(self._sym("BTCUSDT"))
+        )
+
+    def test_current_quarter_rejected(self):
+        """Regression 2: CURRENT_QUARTER is rejected."""
+        self.assertFalse(
+            __import__("binance.contracts", fromlist=["_passes_exchange_info_filters"])
+            ._passes_exchange_info_filters(self._sym("BTCUSDT", contractType="CURRENT_QUARTER"))
+        )
+
+    def test_next_quarter_rejected(self):
+        """Regression 3: NEXT_QUARTER is rejected."""
+        self.assertFalse(
+            __import__("binance.contracts", fromlist=["_passes_exchange_info_filters"])
+            ._passes_exchange_info_filters(self._sym("BTCUSDT", contractType="NEXT_QUARTER"))
+        )
+
+    def test_tradifi_perpetual_rejected(self):
+        """Regression 4: TRADIFI_PERPETUAL is rejected (contractType is authoritative)."""
+        self.assertFalse(
+            __import__("binance.contracts", fromlist=["_passes_exchange_info_filters"])
+            ._passes_exchange_info_filters(self._sym("XAUUSDT", contractType="TRADIFI_PERPETUAL"))
+        )
+
+    def test_missing_contract_type_rejected(self):
+        """Regression 5: missing contractType fails closed (USDT non-perpetual/unknown)."""
+        d = self._sym("BTCUSDT")
+        del d["contractType"]
+        self.assertFalse(
+            __import__("binance.contracts", fromlist=["_passes_exchange_info_filters"])
+            ._passes_exchange_info_filters(d)
+        )
+
+    def test_index_underlying_rejected(self):
+        """Regression 6: INDEX-style products (BTCDOMUSDT, ALLUSDT) are rejected."""
+        f = __import__("binance.contracts", fromlist=["_passes_exchange_info_filters"])
+        self.assertFalse(f._passes_exchange_info_filters(self._sym("BTCDOMUSDT", underlyingType="INDEX")))
+        self.assertFalse(f._passes_exchange_info_filters(self._sym("ALLUSDT", underlyingType="INDEX")))
 
     def test_trading_usdt_coin_accept(self):
         self.assertTrue(
             __import__("binance.contracts", fromlist=["_passes_exchange_info_filters"])
             ._passes_exchange_info_filters(self._sym("BTCUSDT"))
         )
+
+    def test_existing_exclusions_remain_effective(self):
+        """Regression 7: DEFAULT_EXCLUDE + leveraged UP/DOWN exclusion still drop symbols."""
+        f = __import__("binance.contracts", fromlist=["_passes_exchange_info_filters"])
+        for sym in DEFAULT_EXCLUDE:
+            self.assertFalse(f._passes_exchange_info_filters(self._sym(sym)),
+                             msg=f"DEFAULT_EXCLUDE symbol {sym} must stay rejected")
+        for sym in ("BTCUPUSDT", "BTCDOWNUSDT", "SOLUPUSDT", "SOLDOWNUSDT"):
+            self.assertFalse(f._passes_exchange_info_filters(self._sym(sym)),
+                             msg=f"leveraged-token symbol {sym} must stay rejected")
+
+    def test_liquidity_gate_constant_unchanged(self):
+        """Regression 8: the $50M 24h quote-volume gate is unchanged."""
+        self.assertEqual(MIN_QUOTE_VOLUME_USDT, 50_000_000)
+
+    def test_max_symbols_constant_unchanged(self):
+        """Regression 9: manual-list cap MAX_SYMBOLS remains 10 (the
+        auto-discovery universe cap lives in scanner.AUTO_DISCOVERY_MAX_SYMBOLS
+        and is pinned separately in tests/test_scanner_concurrency.py)."""
+        self.assertEqual(MAX_SYMBOLS, 10)
 
     def test_underlying_type_equity_rejected(self):
         self.assertFalse(
@@ -339,17 +404,17 @@ class TestDiscoverLiquidUsdtSymbolsHappyPath(unittest.TestCase):
 
     def test_basic_discovery(self):
         exch = _exchange_info([
-            {"symbol": "BTCUSDT", "status": "TRADING", "quoteAsset": "USDT", "underlyingType": "COIN"},
-            {"symbol": "ETHUSDT", "status": "TRADING", "quoteAsset": "USDT", "underlyingType": "COIN"},
-            {"symbol": "BNBUSDT", "status": "TRADING", "quoteAsset": "USDT", "underlyingType": "COIN"},
-            {"symbol": "XRPUSDT", "status": "TRADING", "quoteAsset": "USDT", "underlyingType": "COIN"},
-            {"symbol": "ADAUSDT", "status": "TRADING", "quoteAsset": "USDT", "underlyingType": "COIN"},
-            {"symbol": "DOGEUSDT", "status": "TRADING", "quoteAsset": "USDT", "underlyingType": "COIN"},
-            {"symbol": "SOLUSDT", "status": "TRADING", "quoteAsset": "USDT", "underlyingType": "COIN"},
-            {"symbol": "AVAXUSDT", "status": "TRADING", "quoteAsset": "USDT", "underlyingType": "COIN"},
-            {"symbol": "MATICUSDT", "status": "TRADING", "quoteAsset": "USDT", "underlyingType": "COIN"},
-            {"symbol": "LINKUSDT", "status": "TRADING", "quoteAsset": "USDT", "underlyingType": "COIN"},
-            {"symbol": "ATOMUSDT", "status": "TRADING", "quoteAsset": "USDT", "underlyingType": "COIN"},
+            {"symbol": "BTCUSDT", "status": "TRADING", "quoteAsset": "USDT", "contractType": "PERPETUAL", "underlyingType": "COIN"},
+            {"symbol": "ETHUSDT", "status": "TRADING", "quoteAsset": "USDT", "contractType": "PERPETUAL", "underlyingType": "COIN"},
+            {"symbol": "BNBUSDT", "status": "TRADING", "quoteAsset": "USDT", "contractType": "PERPETUAL", "underlyingType": "COIN"},
+            {"symbol": "XRPUSDT", "status": "TRADING", "quoteAsset": "USDT", "contractType": "PERPETUAL", "underlyingType": "COIN"},
+            {"symbol": "ADAUSDT", "status": "TRADING", "quoteAsset": "USDT", "contractType": "PERPETUAL", "underlyingType": "COIN"},
+            {"symbol": "DOGEUSDT", "status": "TRADING", "quoteAsset": "USDT", "contractType": "PERPETUAL", "underlyingType": "COIN"},
+            {"symbol": "SOLUSDT", "status": "TRADING", "quoteAsset": "USDT", "contractType": "PERPETUAL", "underlyingType": "COIN"},
+            {"symbol": "AVAXUSDT", "status": "TRADING", "quoteAsset": "USDT", "contractType": "PERPETUAL", "underlyingType": "COIN"},
+            {"symbol": "MATICUSDT", "status": "TRADING", "quoteAsset": "USDT", "contractType": "PERPETUAL", "underlyingType": "COIN"},
+            {"symbol": "LINKUSDT", "status": "TRADING", "quoteAsset": "USDT", "contractType": "PERPETUAL", "underlyingType": "COIN"},
+            {"symbol": "ATOMUSDT", "status": "TRADING", "quoteAsset": "USDT", "contractType": "PERPETUAL", "underlyingType": "COIN"},
         ])
         tickers = _ticker_all([
             _make_ticker("BTCUSDT", 2_000_000_000),
@@ -366,7 +431,7 @@ class TestDiscoverLiquidUsdtSymbolsHappyPath(unittest.TestCase):
         ])
         self.fake.set_responses([exch, tickers])
 
-        syms = discover_liquid_usdt_symbols(self._client(), max_symbols=MAX_SYMBOLS)
+        syms = discover_liquid_usdt_symbols(self._client(), max_symbols=10)
         # ATOM excluded for low volume; everything else passes.
         # Sorted alphabetically: ADA < AVAX < BNB < BTC < DOGE < ETH < LINK < MATIC < SOL < XRP
         expected = [
@@ -377,10 +442,10 @@ class TestDiscoverLiquidUsdtSymbolsHappyPath(unittest.TestCase):
 
     def test_sorted_and_capped(self):
         exch = _exchange_info([
-            {"symbol": "ZZZUSDT", "status": "TRADING", "quoteAsset": "USDT", "underlyingType": "COIN"},
-            {"symbol": "AAAUSDT", "status": "TRADING", "quoteAsset": "USDT", "underlyingType": "COIN"},
-            {"symbol": "MMMUSDT", "status": "TRADING", "quoteAsset": "USDT", "underlyingType": "COIN"},
-            {"symbol": "BBBUSDT", "status": "TRADING", "quoteAsset": "USDT", "underlyingType": "COIN"},
+            {"symbol": "ZZZUSDT", "status": "TRADING", "quoteAsset": "USDT", "contractType": "PERPETUAL", "underlyingType": "COIN"},
+            {"symbol": "AAAUSDT", "status": "TRADING", "quoteAsset": "USDT", "contractType": "PERPETUAL", "underlyingType": "COIN"},
+            {"symbol": "MMMUSDT", "status": "TRADING", "quoteAsset": "USDT", "contractType": "PERPETUAL", "underlyingType": "COIN"},
+            {"symbol": "BBBUSDT", "status": "TRADING", "quoteAsset": "USDT", "contractType": "PERPETUAL", "underlyingType": "COIN"},
         ])
         tickers = _ticker_all([
             _make_ticker("ZZZUSDT", 1_000_000_000),
@@ -394,8 +459,8 @@ class TestDiscoverLiquidUsdtSymbolsHappyPath(unittest.TestCase):
 
     def test_deduplication(self):
         exch = _exchange_info([
-            {"symbol": "BTCUSDT", "status": "TRADING", "quoteAsset": "USDT", "underlyingType": "COIN"},
-            {"symbol": "BTCUSDT", "status": "TRADING", "quoteAsset": "USDT", "underlyingType": "COIN"},  # dup
+            {"symbol": "BTCUSDT", "status": "TRADING", "quoteAsset": "USDT", "contractType": "PERPETUAL", "underlyingType": "COIN"},
+            {"symbol": "BTCUSDT", "status": "TRADING", "quoteAsset": "USDT", "contractType": "PERPETUAL", "underlyingType": "COIN"},  # dup
         ])
         tickers = _ticker_all([_make_ticker("BTCUSDT", 1_000_000_000)])
         self.fake.set_responses([exch, tickers])
@@ -424,42 +489,42 @@ class TestDiscoverLiquidityGate(unittest.TestCase):
         return BinancePublicClient(timeout_sec=10, max_retries=1, backoff_base_sec=1)
 
     def test_below_threshold_excluded(self):
-        exch = _exchange_info([{"symbol": "COINUSDT", "status": "TRADING", "quoteAsset": "USDT", "underlyingType": "COIN"}])
+        exch = _exchange_info([{"symbol": "COINUSDT", "status": "TRADING", "quoteAsset": "USDT", "contractType": "PERPETUAL", "underlyingType": "COIN"}])
         tickers = _ticker_all([_make_ticker("COINUSDT", MIN_QUOTE_VOLUME_USDT - 1)])
         self.fake.set_responses([exch, tickers])
         syms = discover_liquid_usdt_symbols(self._client())
         self.assertEqual(syms, [])
 
     def test_at_threshold_included(self):
-        exch = _exchange_info([{"symbol": "COINUSDT", "status": "TRADING", "quoteAsset": "USDT", "underlyingType": "COIN"}])
+        exch = _exchange_info([{"symbol": "COINUSDT", "status": "TRADING", "quoteAsset": "USDT", "contractType": "PERPETUAL", "underlyingType": "COIN"}])
         tickers = _ticker_all([_make_ticker("COINUSDT", MIN_QUOTE_VOLUME_USDT)])
         self.fake.set_responses([exch, tickers])
         syms = discover_liquid_usdt_symbols(self._client())
         self.assertEqual(syms, ["COINUSDT"])
 
     def test_above_threshold_included(self):
-        exch = _exchange_info([{"symbol": "COINUSDT", "status": "TRADING", "quoteAsset": "USDT", "underlyingType": "COIN"}])
+        exch = _exchange_info([{"symbol": "COINUSDT", "status": "TRADING", "quoteAsset": "USDT", "contractType": "PERPETUAL", "underlyingType": "COIN"}])
         tickers = _ticker_all([_make_ticker("COINUSDT", MIN_QUOTE_VOLUME_USDT + 1)])
         self.fake.set_responses([exch, tickers])
         syms = discover_liquid_usdt_symbols(self._client())
         self.assertEqual(syms, ["COINUSDT"])
 
     def test_missing_ticker_excluded(self):
-        exch = _exchange_info([{"symbol": "MISSUSDT", "status": "TRADING", "quoteAsset": "USDT", "underlyingType": "COIN"}])
+        exch = _exchange_info([{"symbol": "MISSUSDT", "status": "TRADING", "quoteAsset": "USDT", "contractType": "PERPETUAL", "underlyingType": "COIN"}])
         tickers = _ticker_all([_make_ticker("OTHERUSDT", 1_000_000_000)])  # MISS not in ticker list
         self.fake.set_responses([exch, tickers])
         syms = discover_liquid_usdt_symbols(self._client())
         self.assertEqual(syms, [])
 
     def test_malformed_quote_volume_excluded(self):
-        exch = _exchange_info([{"symbol": "BADUSDT", "status": "TRADING", "quoteAsset": "USDT", "underlyingType": "COIN"}])
+        exch = _exchange_info([{"symbol": "BADUSDT", "status": "TRADING", "quoteAsset": "USDT", "contractType": "PERPETUAL", "underlyingType": "COIN"}])
         tickers = _ticker_all([{"symbol": "BADUSDT", "quoteVolume": "nope"}])
         self.fake.set_responses([exch, tickers])
         syms = discover_liquid_usdt_symbols(self._client())
         self.assertEqual(syms, [])
 
     def test_null_quote_volume_excluded(self):
-        exch = _exchange_info([{"symbol": "NULLUSDT", "status": "TRADING", "quoteAsset": "USDT", "underlyingType": "COIN"}])
+        exch = _exchange_info([{"symbol": "NULLUSDT", "status": "TRADING", "quoteAsset": "USDT", "contractType": "PERPETUAL", "underlyingType": "COIN"}])
         tickers = _ticker_all([{"symbol": "NULLUSDT", "quoteVolume": None}])
         self.fake.set_responses([exch, tickers])
         syms = discover_liquid_usdt_symbols(self._client())
@@ -479,10 +544,10 @@ class TestDiscoverExclusions(unittest.TestCase):
 
     def test_leveraged_tokens_dropped(self):
         exch = _exchange_info([
-            {"symbol": "BTCUPUSDT", "status": "TRADING", "quoteAsset": "USDT", "underlyingType": "COIN"},
-            {"symbol": "BTCDOWNUSDT", "status": "TRADING", "quoteAsset": "USDT", "underlyingType": "COIN"},
-            {"symbol": "ETHUPUSDT", "status": "TRADING", "quoteAsset": "USDT", "underlyingType": "COIN"},
-            {"symbol": "BTCUSDT", "status": "TRADING", "quoteAsset": "USDT", "underlyingType": "COIN"},
+            {"symbol": "BTCUPUSDT", "status": "TRADING", "quoteAsset": "USDT", "contractType": "PERPETUAL", "underlyingType": "COIN"},
+            {"symbol": "BTCDOWNUSDT", "status": "TRADING", "quoteAsset": "USDT", "contractType": "PERPETUAL", "underlyingType": "COIN"},
+            {"symbol": "ETHUPUSDT", "status": "TRADING", "quoteAsset": "USDT", "contractType": "PERPETUAL", "underlyingType": "COIN"},
+            {"symbol": "BTCUSDT", "status": "TRADING", "quoteAsset": "USDT", "contractType": "PERPETUAL", "underlyingType": "COIN"},
         ])
         tickers = _ticker_all([
             _make_ticker("BTCUPUSDT", 1_000_000_000),
@@ -497,9 +562,9 @@ class TestDiscoverExclusions(unittest.TestCase):
     def test_excluded_list_dropped(self):
         excl_symbols = list(DEFAULT_EXCLUDE)[:3]
         exch = _exchange_info([
-            {"symbol": s, "status": "TRADING", "quoteAsset": "USDT", "underlyingType": "COIN"} for s in excl_symbols
+            {"symbol": s, "status": "TRADING", "quoteAsset": "USDT", "contractType": "PERPETUAL", "underlyingType": "COIN"} for s in excl_symbols
         ] + [
-            {"symbol": "BTCUSDT", "status": "TRADING", "quoteAsset": "USDT", "underlyingType": "COIN"},
+            {"symbol": "BTCUSDT", "status": "TRADING", "quoteAsset": "USDT", "contractType": "PERPETUAL", "underlyingType": "COIN"},
         ])
         tickers = _ticker_all([
             _make_ticker(s, 1_000_000_000) for s in excl_symbols
@@ -515,7 +580,7 @@ class TestDiscoverExclusions(unittest.TestCase):
         exch = _exchange_info([
             {"symbol": "BREAKUSDT", "status": "BREAK", "quoteAsset": "USDT", "underlyingType": "COIN"},
             {"symbol": "HALTUSDT", "status": "HALTED", "quoteAsset": "USDT", "underlyingType": "COIN"},
-            {"symbol": "BTCUSDT", "status": "TRADING", "quoteAsset": "USDT", "underlyingType": "COIN"},
+            {"symbol": "BTCUSDT", "status": "TRADING", "quoteAsset": "USDT", "contractType": "PERPETUAL", "underlyingType": "COIN"},
         ])
         tickers = _ticker_all([
             _make_ticker("BREAKUSDT", 1_000_000_000),
@@ -530,7 +595,7 @@ class TestDiscoverExclusions(unittest.TestCase):
         exch = _exchange_info([
             {"symbol": "BTCBTC", "status": "TRADING", "quoteAsset": "BTC", "underlyingType": "COIN"},
             {"symbol": "ETHBUSD", "status": "TRADING", "quoteAsset": "BUSD", "underlyingType": "COIN"},
-            {"symbol": "BTCUSDT", "status": "TRADING", "quoteAsset": "USDT", "underlyingType": "COIN"},
+            {"symbol": "BTCUSDT", "status": "TRADING", "quoteAsset": "USDT", "contractType": "PERPETUAL", "underlyingType": "COIN"},
         ])
         tickers = _ticker_all([
             _make_ticker("BTCBTC", 1_000_000_000),
@@ -574,7 +639,7 @@ class TestDiscoverFailureNoSilentFallback(unittest.TestCase):
 
     def test_ticker_http_failure_raises(self):
         exch = _exchange_info([
-            {"symbol": "BTCUSDT", "status": "TRADING", "quoteAsset": "USDT", "underlyingType": "COIN"},
+            {"symbol": "BTCUSDT", "status": "TRADING", "quoteAsset": "USDT", "contractType": "PERPETUAL", "underlyingType": "COIN"},
         ])
         self.fake.set_responses([exch, urllib.error.URLError("network down")])
         with self.assertRaises(urllib.error.URLError):
@@ -582,7 +647,7 @@ class TestDiscoverFailureNoSilentFallback(unittest.TestCase):
 
     def test_ticker_malformed_raises(self):
         exch = _exchange_info([
-            {"symbol": "BTCUSDT", "status": "TRADING", "quoteAsset": "USDT", "underlyingType": "COIN"},
+            {"symbol": "BTCUSDT", "status": "TRADING", "quoteAsset": "USDT", "contractType": "PERPETUAL", "underlyingType": "COIN"},
         ])
         self.fake.set_responses([exch, b"not-json"])
         with self.assertRaises(ValueError):
@@ -602,7 +667,8 @@ class TestUnderlyingTypeFilter(unittest.TestCase):
 
     def _run(self, *symbols_with_ut, expect: list[str]) -> None:
         exch = _exchange_info([
-            {"symbol": s, "status": "TRADING", "quoteAsset": "USDT", "underlyingType": ut}
+            {"symbol": s, "status": "TRADING", "quoteAsset": "USDT",
+             "contractType": "PERPETUAL", "underlyingType": ut}
             for s, ut in symbols_with_ut
         ])
         tickers = _ticker_all([_make_ticker(s, 1_000_000_000) for s, _ut in symbols_with_ut])
@@ -652,8 +718,8 @@ class TestLiquidityRanking(unittest.TestCase):
         # High-volume symbol that sorts late alphabetically outranks a
         # low-volume symbol that sorts early alphabetically.
         exch = _exchange_info([
-            {"symbol": "AAADUSDT", "status": "TRADING", "quoteAsset": "USDT", "underlyingType": "COIN"},
-            {"symbol": "ZZZUSDT", "status": "TRADING", "quoteAsset": "USDT", "underlyingType": "COIN"},
+            {"symbol": "AAADUSDT", "status": "TRADING", "quoteAsset": "USDT", "contractType": "PERPETUAL", "underlyingType": "COIN"},
+            {"symbol": "ZZZUSDT", "status": "TRADING", "quoteAsset": "USDT", "contractType": "PERPETUAL", "underlyingType": "COIN"},
         ])
         tickers = _ticker_all([
             _make_ticker("AAADUSDT", 60_000_000),     # qualifies but lower volume
@@ -666,10 +732,10 @@ class TestLiquidityRanking(unittest.TestCase):
 
     def test_top_n_selected_by_volume(self):
         exch = _exchange_info([
-            {"symbol": "AUSDT", "status": "TRADING", "quoteAsset": "USDT", "underlyingType": "COIN"},
-            {"symbol": "BUSDT", "status": "TRADING", "quoteAsset": "USDT", "underlyingType": "COIN"},
-            {"symbol": "CUSDT", "status": "TRADING", "quoteAsset": "USDT", "underlyingType": "COIN"},
-            {"symbol": "DUSDT", "status": "TRADING", "quoteAsset": "USDT", "underlyingType": "COIN"},
+            {"symbol": "AUSDT", "status": "TRADING", "quoteAsset": "USDT", "contractType": "PERPETUAL", "underlyingType": "COIN"},
+            {"symbol": "BUSDT", "status": "TRADING", "quoteAsset": "USDT", "contractType": "PERPETUAL", "underlyingType": "COIN"},
+            {"symbol": "CUSDT", "status": "TRADING", "quoteAsset": "USDT", "contractType": "PERPETUAL", "underlyingType": "COIN"},
+            {"symbol": "DUSDT", "status": "TRADING", "quoteAsset": "USDT", "contractType": "PERPETUAL", "underlyingType": "COIN"},
         ])
         tickers = _ticker_all([
             _make_ticker("AUSDT", 100_000_000),
@@ -684,9 +750,9 @@ class TestLiquidityRanking(unittest.TestCase):
 
     def test_output_is_alphabetical_among_selected(self):
         exch = _exchange_info([
-            {"symbol": "ZUSDT", "status": "TRADING", "quoteAsset": "USDT", "underlyingType": "COIN"},
-            {"symbol": "AUSDT", "status": "TRADING", "quoteAsset": "USDT", "underlyingType": "COIN"},
-            {"symbol": "MUSDT", "status": "TRADING", "quoteAsset": "USDT", "underlyingType": "COIN"},
+            {"symbol": "ZUSDT", "status": "TRADING", "quoteAsset": "USDT", "contractType": "PERPETUAL", "underlyingType": "COIN"},
+            {"symbol": "AUSDT", "status": "TRADING", "quoteAsset": "USDT", "contractType": "PERPETUAL", "underlyingType": "COIN"},
+            {"symbol": "MUSDT", "status": "TRADING", "quoteAsset": "USDT", "contractType": "PERPETUAL", "underlyingType": "COIN"},
         ])
         tickers = _ticker_all([
             _make_ticker("ZUSDT", 600_000_000),
@@ -700,9 +766,9 @@ class TestLiquidityRanking(unittest.TestCase):
 
     def test_equal_volume_selection_is_deterministic(self):
         exch = _exchange_info([
-            {"symbol": "QUSDT", "status": "TRADING", "quoteAsset": "USDT", "underlyingType": "COIN"},
-            {"symbol": "AUSDT", "status": "TRADING", "quoteAsset": "USDT", "underlyingType": "COIN"},
-            {"symbol": "ZUSDT", "status": "TRADING", "quoteAsset": "USDT", "underlyingType": "COIN"},
+            {"symbol": "QUSDT", "status": "TRADING", "quoteAsset": "USDT", "contractType": "PERPETUAL", "underlyingType": "COIN"},
+            {"symbol": "AUSDT", "status": "TRADING", "quoteAsset": "USDT", "contractType": "PERPETUAL", "underlyingType": "COIN"},
+            {"symbol": "ZUSDT", "status": "TRADING", "quoteAsset": "USDT", "contractType": "PERPETUAL", "underlyingType": "COIN"},
         ])
         tickers = _ticker_all([
             _make_ticker("QUSDT", 200_000_000),
@@ -727,7 +793,7 @@ class TestDiscoveryEndpointAudit(unittest.TestCase):
         return BinancePublicClient(timeout_sec=10, max_retries=1, backoff_base_sec=1)
 
     def test_only_exchange_info_and_ticker_called(self):
-        exch = _exchange_info([{"symbol": "BTCUSDT", "status": "TRADING", "quoteAsset": "USDT", "underlyingType": "COIN"}])
+        exch = _exchange_info([{"symbol": "BTCUSDT", "status": "TRADING", "quoteAsset": "USDT", "contractType": "PERPETUAL", "underlyingType": "COIN"}])
         tickers = _ticker_all([_make_ticker("BTCUSDT", 1_000_000_000)])
         self.fake.set_responses([exch, tickers])
 
@@ -741,7 +807,7 @@ class TestDiscoveryEndpointAudit(unittest.TestCase):
         self.assertEqual(captured, expected)
 
     def test_no_private_order_endpoints(self):
-        exch = _exchange_info([{"symbol": "BTCUSDT", "status": "TRADING", "quoteAsset": "USDT", "underlyingType": "COIN"}])
+        exch = _exchange_info([{"symbol": "BTCUSDT", "status": "TRADING", "quoteAsset": "USDT", "contractType": "PERPETUAL", "underlyingType": "COIN"}])
         tickers = _ticker_all([_make_ticker("BTCUSDT", 1_000_000_000)])
         self.fake.set_responses([exch, tickers])
 
@@ -802,10 +868,10 @@ class TestCmdPaperDefaultMode(unittest.TestCase):
         self._liquid_symbols = ["BTCUSDT", "ETHUSDT", "SOLUSDT"]
         self._fake.set_responses([
             _exchange_info([
-                {"symbol": "BTCUSDT", "status": "TRADING", "quoteAsset": "USDT", "underlyingType": "COIN"},
-                {"symbol": "ETHUSDT", "status": "TRADING", "quoteAsset": "USDT", "underlyingType": "COIN"},
-                {"symbol": "SOLUSDT", "status": "TRADING", "quoteAsset": "USDT", "underlyingType": "COIN"},
-                {"symbol": "BNBUSDT", "status": "TRADING", "quoteAsset": "USDT", "underlyingType": "COIN"},
+                {"symbol": "BTCUSDT", "status": "TRADING", "quoteAsset": "USDT", "contractType": "PERPETUAL", "underlyingType": "COIN"},
+                {"symbol": "ETHUSDT", "status": "TRADING", "quoteAsset": "USDT", "contractType": "PERPETUAL", "underlyingType": "COIN"},
+                {"symbol": "SOLUSDT", "status": "TRADING", "quoteAsset": "USDT", "contractType": "PERPETUAL", "underlyingType": "COIN"},
+                {"symbol": "BNBUSDT", "status": "TRADING", "quoteAsset": "USDT", "contractType": "PERPETUAL", "underlyingType": "COIN"},
             ]),
             _ticker_all([
                 _make_ticker("BTCUSDT", 150_000_000),
@@ -876,7 +942,7 @@ class TestCmdPaperDefaultMode(unittest.TestCase):
         # ExchangeInfo with only a sub-threshold symbol + ticker confirming it.
         self._fake.set_responses([
             _exchange_info([
-                {"symbol": "BNBUSDT", "status": "TRADING", "quoteAsset": "USDT", "underlyingType": "COIN"},
+                {"symbol": "BNBUSDT", "status": "TRADING", "quoteAsset": "USDT", "contractType": "PERPETUAL", "underlyingType": "COIN"},
             ]),
             _ticker_all([
                 _make_ticker("BNBUSDT", 10_000_000),  # below 50M threshold
