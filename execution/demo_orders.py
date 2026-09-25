@@ -60,12 +60,19 @@ DEFAULT_ORDER_TIMEOUT: Tuple[float, float] = (10.0, 30.0)
 DEFAULT_RECV_WINDOW = 5000
 
 # Supported order types in this phase.
-ALLOWED_ORDER_TYPES = frozenset(["LIMIT"])
+ALLOWED_ORDER_TYPES = frozenset(["LIMIT", "STOP_MARKET", "TAKE_PROFIT_MARKET"])
 
 # Binance side mapping.
 _SIDE_MAP: Dict[str, str] = {
     "LONG": "BUY",
     "SHORT": "SELL",
+}
+
+# Protective-order side mapping (close position on fill):
+#   LONG position -> SELL to close; SHORT position -> BUY to close.
+_PROTECTIVE_SIDE_MAP: Dict[str, str] = {
+    "LONG": "SELL",
+    "SHORT": "BUY",
 }
 
 # Time in force for LIMIT orders in this phase.
@@ -177,6 +184,360 @@ def build_order_request(
         "Content-Type": "application/x-www-form-urlencoded",
     }
     return Request(url, method="POST", headers=headers, data=b"")
+
+
+# ---------------------------------------------------------------------------
+# Protective-order helpers (SL/TP on fill)
+# ---------------------------------------------------------------------------
+
+def protective_side(direction: str) -> str:
+    """Side for a protective (close) order given the position direction.
+
+    LONG position -> SELL to close; SHORT position -> BUY to close.
+    """
+    try:
+        return _PROTECTIVE_SIDE_MAP[direction]
+    except KeyError:
+        raise ValueError(
+            f"Unsupported direction {direction!r}; expected LONG or SHORT"
+        )
+
+
+def build_protective_order_params(
+    signal: ApprovedSignalRef,
+    client_order_id: str,
+    order_type: str,
+    trigger_price: float,
+    quantity: float,
+) -> Dict[str, Any]:
+    """Build parameter dict for a protective STOP_MARKET / TAKE_PROFIT_MARKET order.
+
+    Args:
+        signal: ApprovedSignalRef (direction, symbol from exact D15).
+        client_order_id: unique client-side order id for this protective order.
+        order_type: "STOP_MARKET" (stop-loss) or "TAKE_PROFIT_MARKET" (take-profit).
+        trigger_price: exact D15 SL or TP price (the stopPrice / trigger).
+        quantity: quantity to close (positive).
+
+    Returns:
+        Dict suitable for signing and sending to Binance.
+    """
+    if not client_order_id:
+        raise ValueError("client_order_id must be non-empty")
+    if order_type not in ("STOP_MARKET", "TAKE_PROFIT_MARKET"):
+        raise ValueError(
+            f"order_type must be STOP_MARKET or TAKE_PROFIT_MARKET, got {order_type!r}"
+        )
+    if trigger_price <= 0:
+        raise ValueError("trigger_price must be positive")
+    if quantity <= 0:
+        raise ValueError("quantity must be positive")
+
+    side = protective_side(signal.direction)
+
+    params: Dict[str, Any] = {
+        "symbol": signal.symbol,
+        "side": side,
+        "type": order_type,
+        "quantity": str(quantity),
+        "stopPrice": str(trigger_price),
+        "newClientOrderId": client_order_id,
+        "reduceOnly": "true",
+    }
+    return params
+
+
+def place_protective_order(
+    config: ExecutionConfig,
+    signal: ApprovedSignalRef,
+    approval: SignalApproval,
+    client_order_id: str,
+    order_type: str,
+    trigger_price: float,
+    quantity: float,
+    ledger: Optional[ExecutionLedger] = None,
+    timeout: Optional[Tuple[float, float]] = None,
+) -> ExecutionResult:
+    """Place a single protective order (STOP_MARKET or TAKE_PROFIT_MARKET).
+
+    Args:
+        config: ExecutionConfig.
+        signal: ApprovedSignalRef — direction/symbol from exact D15.
+        approval: SignalApproval (approved=True).
+        client_order_id: unique client order id.
+        order_type: "STOP_MARKET" or "TAKE_PROFIT_MARKET".
+        trigger_price: exact D15 SL or TP price.
+        quantity: quantity to close.
+        ledger: optional ExecutionLedger.
+        timeout: optional (connect, read) timeout tuple.
+
+    Returns:
+        ExecutionResult.
+
+    Raises:
+        ApprovalRequiredError, RiskCheckFailedError, DuplicateOrderIdError,
+        UnknownExecutionStateError, DemoOrderError.
+    """
+    if timeout is None:
+        timeout = DEFAULT_ORDER_TIMEOUT
+
+    now_ms = int(time.time() * 1000)
+
+    # --- Approval gate ---
+    if approval is None:
+        raise ApprovalRequiredError(
+            "SignalApproval is required; none provided"
+        )
+    if not approval.is_approved():
+        raise ApprovalRequiredError(
+            "SignalApproval.approved must be True; default is False"
+        )
+
+    # --- Risk validation ---
+    validator = RiskValidator(config)
+    try:
+        validator.validate_signal(signal)
+    except RiskValidationError as exc:
+        raise RiskCheckFailedError(
+            f"Signal risk check failed: [{exc.code}] {exc.reason}"
+        ) from exc
+
+    if not client_order_id:
+        raise DemoOrderError("client_order_id must be non-empty")
+
+    # Build OrderRequest for order-level risk validation.
+    order_req = OrderRequest(
+        client_order_id=client_order_id,
+        symbol=signal.symbol,
+        side=protective_side(signal.direction),
+        order_type=order_type,
+        quantity=quantity,
+        price=None,  # STOP_MARKET / TAKE_PROFIT_MARKET have no price
+        stop_price=trigger_price,
+        time_in_force=None,
+        reduce_only=True,
+        close_position=False,
+        signal_id=signal.signal_id,
+        strategy_version=signal.strategy_version,
+        requested_at_ms=now_ms,
+    )
+
+    try:
+        validator.validate_order(order_req)
+    except RiskValidationError as exc:
+        raise RiskCheckFailedError(
+            f"Order risk check failed: [{exc.code}] {exc.reason}"
+        ) from exc
+
+    # --- Duplicate client order ID guard (local, in-memory) ---
+    if _is_duplicate_local(client_order_id, signal.signal_id):
+        raise DuplicateOrderIdError(
+            f"client_order_id {client_order_id!r} already used for signal "
+            f"{signal.signal_id!r}"
+        )
+    _record_local_order_id(client_order_id, signal.signal_id)
+
+    # --- Build signed request ---
+    params = build_protective_order_params(
+        signal, client_order_id, order_type, trigger_price, quantity
+    )
+    signed_query = build_order_query_string(params, config.api_secret)
+    url = build_order_url(signed_query)
+    req = build_order_request(url, config.api_key)
+
+    # --- Execute POST ---
+    try:
+        with urlopen(req, timeout=timeout[1]) as resp:
+            status_code = resp.status
+            body_bytes = resp.read()
+            body = body_bytes.decode("utf-8", errors="replace")
+    except urllib.error.HTTPError as http_err:
+        err_status = http_err.code
+        try:
+            err_body = http_err.read().decode("utf-8", errors="replace")
+        except Exception:
+            err_body = ""
+        if err_body:
+            try:
+                binance_err = _parse_binance_error_body(
+                    err_body, url, err_status
+                )
+                return _error_result(
+                    client_order_id=client_order_id,
+                    signal=signal,
+                    order_req=order_req,
+                    status="REJECTED",
+                    message=(
+                        f"Binance API error{maybe_code(binance_err.code)}: "
+                        f"{binance_err}"
+                    ),
+                    error_code=binance_err.code,
+                    executed_at_ms=now_ms,
+                    ledger=ledger,
+                )
+            except Exception:
+                return _error_result(
+                    client_order_id=client_order_id,
+                    signal=signal,
+                    order_req=order_req,
+                    status="REJECTED",
+                    message=(
+                        f"HTTP {_classify_http_status(err_status)}: "
+                        f"{err_body[:200]!r}"
+                    ),
+                    error_code=None,
+                    executed_at_ms=now_ms,
+                    ledger=ledger,
+                )
+        else:
+            return _error_result(
+                client_order_id=client_order_id,
+                signal=signal,
+                order_req=order_req,
+                status="REJECTED",
+                message=f"HTTP {_classify_http_status(err_status)}",
+                error_code=None,
+                executed_at_ms=now_ms,
+                ledger=ledger,
+            )
+    except (urllib.error.URLError, TimeoutError) as network_err:
+        raise UnknownExecutionStateError(
+            "Request may have reached Binance but response status is unknown "
+            f"({type(network_err).__name__}); do not retry automatically",
+            client_order_id=client_order_id,
+            signal_id=signal.signal_id,
+        ) from network_err
+
+    # --- Parse response ---
+    try:
+        data = json.loads(body)
+    except (json.JSONDecodeError, ValueError) as parse_err:
+        return _error_result(
+            client_order_id=client_order_id,
+            signal=signal,
+            order_req=order_req,
+            status="ERROR",
+            message=f"Response parse error: {parse_err}",
+            error_code=None,
+            executed_at_ms=now_ms,
+            ledger=ledger,
+        )
+
+    if not isinstance(data, dict):
+        return _error_result(
+            client_order_id=client_order_id,
+            signal=signal,
+            order_req=order_req,
+            status="ERROR",
+            message=f"Unexpected response type: {type(data).__name__}",
+            error_code=None,
+            executed_at_ms=now_ms,
+            ledger=ledger,
+        )
+
+    error_code = data.get("code")
+    error_msg = data.get("msg", "")
+    if error_code is not None or error_msg:
+        return _error_result(
+            client_order_id=client_order_id,
+            signal=signal,
+            order_req=order_req,
+            status="REJECTED",
+            message=(
+                f"Binance API error{maybe_code(error_code)}: "
+                f"{error_msg or body[:200]!r}"
+            ),
+            error_code=error_code,
+            executed_at_ms=now_ms,
+            ledger=ledger,
+        )
+
+    order_id = data.get("orderId")
+    status_resp = data.get("status", "UNKNOWN")
+    mapped_status = _map_binance_order_status(status_resp)
+
+    result = ExecutionResult(
+        client_order_id=client_order_id,
+        symbol=data.get("symbol", signal.symbol),
+        side=data.get("side", protective_side(signal.direction)),
+        order_type=data.get("type", order_type),
+        quantity=quantity,
+        signal_id=signal.signal_id,
+        status=mapped_status,
+        message=(
+            f"Demo {order_type} order {status_resp}; "
+            f"orderId={order_id!r}; "
+            f"stopPrice={trigger_price!r}"
+        ),
+        binance_order_id=(int(order_id) if order_id is not None else None),
+        filled_qty=None,
+        fill_price=None,
+        fee=None,
+        error_code=None,
+        executed_at_ms=now_ms,
+    )
+
+    if ledger is not None:
+        _log_result(ledger, order_req, result)
+
+    return result
+
+
+def place_protective_orders(
+    config: ExecutionConfig,
+    signal: ApprovedSignalRef,
+    approval: SignalApproval,
+    entry_client_order_id: str,
+    quantity: float,
+    ledger: Optional[ExecutionLedger] = None,
+    timeout: Optional[Tuple[float, float]] = None,
+) -> Dict[str, ExecutionResult]:
+    """Place BOTH protective orders (SL + TP) for an filled entry.
+
+    Args:
+        config: ExecutionConfig.
+        signal: ApprovedSignalRef with exact D15 SL/TP.
+        approval: SignalApproval (approved=True).
+        entry_client_order_id: the entry order's clientOrderId (used as prefix
+            for deriving protective order IDs).
+        quantity: quantity to close (must match entry quantity).
+        ledger: optional ExecutionLedger.
+        timeout: optional (connect, read) timeout tuple.
+
+    Returns:
+        Dict with keys "sl" and "tp", each an ExecutionResult.
+    """
+    if timeout is None:
+        timeout = DEFAULT_ORDER_TIMEOUT
+
+    sl_cid = f"{entry_client_order_id}-SL"
+    tp_cid = f"{entry_client_order_id}-TP"
+
+    sl_result = place_protective_order(
+        config=config,
+        signal=signal,
+        approval=approval,
+        client_order_id=sl_cid,
+        order_type="STOP_MARKET",
+        trigger_price=signal.sl,
+        quantity=quantity,
+        ledger=ledger,
+        timeout=timeout,
+    )
+
+    tp_result = place_protective_order(
+        config=config,
+        signal=signal,
+        approval=approval,
+        client_order_id=tp_cid,
+        order_type="TAKE_PROFIT_MARKET",
+        trigger_price=signal.tp,
+        quantity=quantity,
+        ledger=ledger,
+        timeout=timeout,
+    )
+
+    return {"sl": sl_result, "tp": tp_result}
 
 
 # ---------------------------------------------------------------------------
@@ -529,7 +890,7 @@ def _error_result(
         client_order_id=client_order_id,
         symbol=signal.symbol,
         side=direction_to_side(signal.direction),
-        order_type="LIMIT",
+        order_type=order_req.order_type,
         quantity=order_req.quantity,
         signal_id=signal.signal_id,
         status=status,
@@ -594,11 +955,15 @@ __all__ = [
     "DEFAULT_ORDER_TIMEOUT",
     "ALLOWED_ORDER_TYPES",
     "place_limit_order",
+    "place_protective_order",
+    "place_protective_orders",
     "direction_to_side",
+    "protective_side",
     "build_order_params",
     "build_order_query_string",
     "build_order_url",
     "build_order_request",
+    "build_protective_order_params",
     "DemoOrderError",
     "ApprovalRequiredError",
     "RiskCheckFailedError",

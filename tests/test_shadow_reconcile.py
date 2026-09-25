@@ -79,7 +79,7 @@ class _TmpReconcile(unittest.TestCase):
         return self.ledger.read_all()
 
     def reconcile(self, open_orders=None, trades=None, trades_error=False,
-                  open_error=False, **kw):
+                  open_error=False, place_protective=True, **kw):
         def fo(cfg):
             if open_error:
                 raise RuntimeError("transport down")
@@ -92,9 +92,11 @@ class _TmpReconcile(unittest.TestCase):
 
         buf = io.StringIO()
         with redirect_stdout(buf), redirect_stderr(buf):
-            return sr.reconcile_once(ledger_path=self.ledger_path,
-                                     fetch_open_orders=fo, fetch_trades=ft,
-                                     **kw)
+            with patch.object(sr, "_PLACE_PROTECTIVE_CALLBACK",
+                              None if place_protective else lambda *a, **k: None):
+                return sr.reconcile_once(ledger_path=self.ledger_path,
+                                         fetch_open_orders=fo, fetch_trades=ft,
+                                         **kw)
 
 
 class TestLifecycleRecognition(_TmpReconcile):
