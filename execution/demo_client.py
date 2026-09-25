@@ -26,6 +26,7 @@ PATH_EXCHANGE_INFO = "/fapi/v1/exchangeInfo"
 PATH_BALANCE = "/fapi/v2/balance"
 PATH_ACCOUNT = "/fapi/v2/account"
 PATH_OPEN_ORDERS = "/fapi/v1/openOrders"
+PATH_USER_TRADES = "/fapi/v1/userTrades"
 
 # Default timeouts (connect, read) in seconds
 DEFAULT_TIMEOUT = (10.0, 30.0)
@@ -42,6 +43,7 @@ ALLOWED_PATHS = frozenset([
     PATH_BALANCE,
     PATH_ACCOUNT,
     PATH_OPEN_ORDERS,
+    PATH_USER_TRADES,
 ])
 
 
@@ -177,6 +179,7 @@ ALLOWED_PATHS = frozenset([
     PATH_BALANCE,
     PATH_ACCOUNT,
     PATH_OPEN_ORDERS,
+    PATH_USER_TRADES,
 ])
 
 # ---------------------------------------------------------------------------
@@ -570,6 +573,28 @@ def get_open_orders(
     return data  # type: ignore[return-value]
 
 
+def get_trade_history(
+    config: ExecutionConfig,
+    symbol: str,
+    timeout: Optional[Tuple[float, float]] = None,
+) -> List[Dict[str, Any]]:
+    """GET /fapi/v1/userTrades — account trade history for one symbol.
+
+    Signed, READ-ONLY (reconciliation of fills; no placement capability).
+    Demo host enforced by execute_get/_check_demo_url like every other path.
+    """
+    if not symbol or not isinstance(symbol, str):
+        raise ValueError("symbol must be a non-empty string for userTrades")
+    data = execute_get(config, PATH_USER_TRADES, params={"symbol": symbol},
+                       signed=True, timeout=timeout)
+    if not isinstance(data, list):
+        raise BinanceApiError(
+            f"Expected list from /fapi/v1/userTrades, got {type(data).__name__}",
+            url=build_demo_url(PATH_USER_TRADES),
+        )
+    return data  # type: ignore[return-value]
+
+
 # ---------------------------------------------------------------------------
 # Public API surface
 # ---------------------------------------------------------------------------
@@ -582,6 +607,7 @@ __all__ = [
     "PATH_BALANCE",
     "PATH_ACCOUNT",
     "PATH_OPEN_ORDERS",
+    "PATH_USER_TRADES",
     "DEFAULT_TIMEOUT",
     "DEFAULT_RECV_WINDOW",
     "build_query_string",
@@ -599,4 +625,5 @@ __all__ = [
     "get_balance",
     "get_account",
     "get_open_orders",
+    "get_trade_history",
 ]
