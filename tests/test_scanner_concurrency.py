@@ -190,15 +190,18 @@ class TestFetchConcurrency(unittest.TestCase):
         """
         from unittest.mock import patch as upatch
         import argparse
+        import tempfile
         captured = {}
+        tmp_log = tempfile.mkstemp(suffix=".jsonl")[1]
 
-        def fake_discover(client, max_symbols=None):
+        def fake_discover(client, max_symbols=None, min_quote_volume_usdt=None):
             captured["max_symbols"] = max_symbols
+            captured["min_quote_volume_usdt"] = min_quote_volume_usdt
             return ["BTCUSDT", "ETHUSDT"]
 
         ns = argparse.Namespace(symbols=None, auto_discover=False,
                                 interval=300, max_cycles=0,
-                                log=os.devnull)
+                                log=tmp_log, min_volume=50_000_000.0)
         # max_cycles=0 -> run_loop exits immediately; no kline fetches occur.
         with upatch("binance.contracts.discover_liquid_usdt_symbols",
                     side_effect=fake_discover):
@@ -215,7 +218,7 @@ class TestFetchConcurrency(unittest.TestCase):
         manual = [f"MAN{i}USDT" for i in range(25)]
         ns = argparse.Namespace(symbols=manual, auto_discover=False,
                                 interval=300, max_cycles=0,
-                                log=os.devnull)
+                                log=os.devnull, min_volume=50_000_000.0)
         seen = {}
         RealObserver = scanner.PaperObserver
 

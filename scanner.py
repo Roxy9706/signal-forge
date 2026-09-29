@@ -50,7 +50,12 @@ from binance.market_data import (
     MAX_SYMBOLS,
     MAX_OPEN_SIGNALS,
 )
-from binance.contracts import build_symbol_universe, is_valid_symbol
+from binance.contracts import (
+    build_symbol_universe,
+    is_valid_symbol,
+    discover_liquid_usdt_symbols,
+    MIN_QUOTE_VOLUME_USDT,
+)
 from storage.jsonl import (
     jsonl_append,
     jsonl_read,
@@ -74,6 +79,8 @@ from SignalForge.paper.models import (
     PaperSignalEvent,
     PaperOutcomeEvent,
     DataQualityEvent,
+    CycleEndEvent,
+    ScannerStateEvent,
     make_signal_id,
     make_strategy_version,
 )
@@ -169,6 +176,9 @@ class P5Config:
 
     # Logging
     log_path: str = "data/signals/paper_trade.jsonl"
+
+    # Discovery volume threshold (USDT 24h quote volume minimum).
+    min_quote_volume_usdt: float = MIN_QUOTE_VOLUME_USDT
 
     # Safety
     max_open_signals: int = MAX_OPEN_SIGNALS
@@ -330,6 +340,13 @@ class PaperScanner:
             return []
 
         # ---------------------------------------------------------------------------
+        # Extract rr exactly once, after duplicate checking.
+        # ---------------------------------------------------------------------------
+        rr = d15_result.get("rr")
+        if rr is None:
+            rr = 0.0
+
+        # ---------------------------------------------------------------------------
         # Score: LONG uses final_long, SHORT uses final_short.
         # ---------------------------------------------------------------------------
         if direction == "LONG":
@@ -356,6 +373,7 @@ class PaperScanner:
             tp=take_profit,
             sl=final_sl,
             score=score,
+            rr=rr,
             timeframe="5m",
             horizon_ms=self.config.horizon_ms,
             strategy_version=signal_version,
@@ -516,6 +534,9 @@ class PaperObserver:
 
         # Ensure log directory exists
         Path(self.log_path).parent.mkdir(parents=True, exist_ok=True)
+
+        # Persisted cycle counter so restart doesn't reset cycle numbers.
+        self._cycle_number = 0
 
     def get_existing_signal_ids(self) -> set:
         """Get set of all signal_ids already in the JSONL log."""
@@ -752,10 +773,40 @@ class PaperObserver:
         """
         cycle = 0
         try:
+            # Write running marker so 'status' shows active scanner.
+            state_event = ScannerStateEvent(
+                state="running",
+                poll_time_ms=int(time.time() * 1000),
+                log_path=self.log_path,
+                symbols=list(self.config.symbols),
+                interval_sec=self.config.poll_interval_sec,
+                max_cycles=max_cycles,
+            )
+            jsonl_append(self.log_path, state_event.to_dict())
             while max_cycles is None or cycle < max_cycles:
                 cycle += 1
+                t0 = int(time.time() * 1000)
                 summary = self.run_once()
-                print(f"[P5] Cycle {cycle}: {json.dumps(summary, default=str)}")
+                cycle_event = CycleEndEvent(
+                    cycle_number=cycle,
+                    poll_time_ms=t0,
+                    symbols_discovered=len(self.config.symbols),
+                    symbols_processed=summary["symbols_processed"],
+                    signals_generated=summary["signals_generated"],
+                    outcomes_resolved=summary["outcomes_resolved"],
+                    data_quality_events=summary["data_quality_events"],
+                    error_symbol_count=len(summary.get("errors", {})),
+                    scan_duration_ms=int(time.time() * 1000) - t0,
+                    min_quote_volume_usdt=self.config.min_quote_volume_usdt,
+                )
+                jsonl_append(self.log_path, cycle_event.to_dict())
+                print(f"[P5] Cycle {cycle}/{max_cycles or '?'}: "
+                      f"processed={summary['symbols_processed']}, "
+                      f"signals={summary['signals_generated']}, "
+                      f"outcomes={summary['outcomes_resolved']}, "
+                      f"dq={summary['data_quality_events']}, "
+                      f"errors={len(summary.get('errors', {}))}, "
+                      f"duration={cycle_event.scan_duration_ms}ms")
                 if max_cycles is None or cycle < max_cycles:
                     time.sleep(self.config.poll_interval_sec)
         except KeyboardInterrupt:
@@ -803,6 +854,13 @@ def build_parser() -> argparse.ArgumentParser:
         type=str,
         default="data/signals/paper_trade.jsonl",
         help="JSONL log path (default: data/signals/paper_trade.jsonl)",
+    )
+    paper_parser.add_argument(
+        "--min-volume",
+        type=float,
+        default=MIN_QUOTE_VOLUME_USDT,
+        help=f"Minimum 24h quote volume in USDT for auto-discovery "
+             f"(default: {MIN_QUOTE_VOLUME_USDT:,})",
     )
     paper_parser.add_argument(
         "--auto-discover",
@@ -886,6 +944,7 @@ def cmd_paper(args) -> None:
             symbols = discover_liquid_usdt_symbols(
                 client,
                 max_symbols=AUTO_DISCOVERY_MAX_SYMBOLS,
+                min_quote_volume_usdt=args.min_volume,
             )
         except Exception as e:
             print(f"[P5] FATAL: symbol auto-discovery failed: {e}", file=sys.stderr)

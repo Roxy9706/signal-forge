@@ -1,26 +1,20 @@
-# Paper-trade signal & event models
+# P5 Paper Trade Models
 #
-# P5 paper observation uses immutable Signal objects (from P3 evaluator)
-# and adds paper-specific event records for JSONL logging.
+# Immutable dataclasses for paper observation events.
+# P5 is observation-only — NO orders, NO API keys, NO private endpoints,
+# NO leverage, NO Telegram/webhooks, NO auto-trading.
 #
-# Event types:
-#   - "signal": new paper signal generated from closed candles
-#   - "tp_hit": TP outcome
-#   - "sl_hit": SL outcome
-#   - "expired": 4h expiration without TP/SL
-#   - "data_quality": data quality / evaluation status event
-#
-# JSONL is the source of truth. State cache (if any) is disposable.
-
+# All events are appended to a JSONL log which is the source of truth.
+# State cache (if any) is disposable/rebuildable from JSONL.
 
 from __future__ import annotations
 from dataclasses import dataclass, field
-from typing import Optional, List
+from typing import Optional, List, Dict, Any
 import hashlib
 
 
 # ---------------------------------------------------------------------------
-# Paper signal event (written to JSONL when a new signal is generated)
+# Paper Signal Event
 # ---------------------------------------------------------------------------
 
 @dataclass(frozen=True)
@@ -40,12 +34,13 @@ class PaperSignalEvent:
     tp: float = 0.0
     sl: float = 0.0
     score: float = 0.0    # 0-100
+    rr: float = 0.0       # R:R ratio (TP distance / SL distance)
     timeframe: str = ""   # timeframe of setup (e.g. "5m")
     horizon_ms: int = 0   # 4h = 4*3600*1000
     strategy_version: str = ""  # deterministic config fingerprint
     generated_at: int = 0  # poll time when signal was generated (ms)
 
-    def to_dict(self) -> dict:
+    def to_dict(self) -> Dict[str, Any]:
         return {
             "event": "signal",
             "signal_id": self.signal_id,
@@ -56,6 +51,7 @@ class PaperSignalEvent:
             "tp": self.tp,
             "sl": self.sl,
             "score": self.score,
+            "rr": self.rr,
             "timeframe": self.timeframe,
             "horizon_ms": self.horizon_ms,
             "strategy_version": self.strategy_version,
@@ -82,7 +78,7 @@ class PaperSignalEvent:
 
 
 # ---------------------------------------------------------------------------
-# Paper outcome event (written to JSONL when a signal resolves)
+# Paper Outcome Event
 # ---------------------------------------------------------------------------
 
 @dataclass(frozen=True)
@@ -108,7 +104,7 @@ class PaperOutcomeEvent:
     strategy_version: str = ""
     close_time: int = 0  # close_time of the relevant candle (for recovery)
 
-    def to_dict(self) -> dict:
+    def to_dict(self) -> Dict[str, Any]:
         return {
             "event": self.event,
             "signal_id": self.signal_id,
@@ -149,22 +145,22 @@ class PaperOutcomeEvent:
             direction=result.direction,
             outcome=outcome_map.get(result.outcome, "expired"),
             outcome_time=result.touch_timestamp if result.touch_timestamp is not None else signal_time + result.holding_ms,
-            entry=result.gross_r if result.gross_r else 0,  # placeholder; will be set from signal
-            tp=0.0,  # will be set from signal context
+            entry=0.0,
+            tp=0.0,
             sl=0.0,
             gross_r=result.gross_r if result.gross_r is not None else 0.0,
             net_r=result.net_r if result.net_r is not None else 0.0,
             holding_ms=result.holding_ms if result.holding_ms is not None else 0,
             fee=result.fee,
             slippage=result.slippage,
-            horizon_ms=result.holding_ms * 0 + 4 * 3600 * 1000,  # default 4h
+            horizon_ms=4 * 3600 * 1000,
             strategy_version=strategy_version,
             close_time=close_time,
         )
 
 
 # ---------------------------------------------------------------------------
-# Data quality event
+# Data Quality Event
 # ---------------------------------------------------------------------------
 
 @dataclass(frozen=True)
@@ -182,7 +178,7 @@ class DataQualityEvent:
     missing: bool = False
     error_type: str = ""  # "rate_limit", "server_error", "network_error", "malformed"
 
-    def to_dict(self) -> dict:
+    def to_dict(self) -> Dict[str, Any]:
         return {
             "event": "data_quality",
             "symbol": self.symbol,
@@ -194,6 +190,106 @@ class DataQualityEvent:
             "missing": self.missing,
             "error_type": self.error_type,
         }
+
+
+# ---------------------------------------------------------------------------
+# Cycle End Event — persisted per-cycle metadata
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class CycleEndEvent:
+    """
+    One event written at the end of each run_once() cycle.
+
+    JSONL source of truth for runtime status: last completed cycle,
+    symbols discovered, symbols processed, signals generated, errors,
+    data-quality events, and scan duration.
+    """
+    event: str = "cycle_end"
+    cycle_number: int = 0
+    poll_time_ms: int = 0
+    symbols_discovered: int = 0
+    symbols_processed: int = 0
+    signals_generated: int = 0
+    outcomes_resolved: int = 0
+    data_quality_events: int = 0
+    error_symbol_count: int = 0
+    scan_duration_ms: int = 0
+    min_quote_volume_usdt: float = 50_000_000.0
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "event": "cycle_end",
+            "cycle_number": self.cycle_number,
+            "poll_time_ms": self.poll_time_ms,
+            "symbols_discovered": self.symbols_discovered,
+            "symbols_processed": self.symbols_processed,
+            "signals_generated": self.signals_generated,
+            "outcomes_resolved": self.outcomes_resolved,
+            "data_quality_events": self.data_quality_events,
+            "error_symbol_count": self.error_symbol_count,
+            "scan_duration_ms": self.scan_duration_ms,
+            "min_quote_volume_usdt": self.min_quote_volume_usdt,
+        }
+
+    @classmethod
+    def from_dict(cls, d: Dict[str, Any]) -> "CycleEndEvent":
+        return cls(
+            event=d.get("event", "cycle_end"),
+            cycle_number=int(d.get("cycle_number", 0)),
+            poll_time_ms=int(d.get("poll_time_ms", 0)),
+            symbols_discovered=int(d.get("symbols_discovered", 0)),
+            symbols_processed=int(d.get("symbols_processed", 0)),
+            signals_generated=int(d.get("signals_generated", 0)),
+            outcomes_resolved=int(d.get("outcomes_resolved", 0)),
+            data_quality_events=int(d.get("data_quality_events", 0)),
+            error_symbol_count=int(d.get("error_symbol_count", 0)),
+            scan_duration_ms=int(d.get("scan_duration_ms", 0)),
+            min_quote_volume_usdt=float(d.get("min_quote_volume_usdt", 50_000_000.0)),
+        )
+
+
+# ---------------------------------------------------------------------------
+# Scanner State Event — running/stopped marker
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class ScannerStateEvent:
+    """
+    Marker event written when the scanner starts and stops.
+    Enables 'status' to show running/stopped without external state.
+    """
+    event: str = "scanner_state"
+    state: str = ""          # "running" or "stopped"
+    poll_time_ms: int = 0
+    log_path: str = ""
+    symbols: List[str] = field(default_factory=list)
+    interval_sec: int = 0
+    max_cycles: Optional[int] = None
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "event": "scanner_state",
+            "state": self.state,
+            "poll_time_ms": self.poll_time_ms,
+            "log_path": self.log_path,
+            "symbols": list(self.symbols),
+            "interval_sec": self.interval_sec,
+            "max_cycles": self.max_cycles,
+        }
+
+    @classmethod
+    def from_dict(cls, d: Dict[str, Any]) -> "ScannerStateEvent":
+        mc = d.get("max_cycles")
+        return cls(
+            event=d.get("event", "scanner_state"),
+            state=d.get("state", ""),
+            poll_time_ms=int(d.get("poll_time_ms", 0)),
+            log_path=d.get("log_path", ""),
+            symbols=[str(s) for s in d.get("symbols", [])],
+            interval_sec=int(d.get("interval_sec", 0)),
+            max_cycles=int(mc) if mc is not None else None,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -226,7 +322,6 @@ def make_strategy_version() -> str:
 
     If these parameters ever change, the version changes.
     """
-    # Deterministic fingerprint of the canonical strategy parameters.
     raw = (
         "trend=40:momentum=20:structure=20:volume=20:"
         "tf_1d=25:tf_4h=25:tf_1h=20:tf_15m=20:tf_5m=10:"
