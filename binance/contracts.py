@@ -177,7 +177,7 @@ def _parse_quote_volume(ticker: Dict[str, Any]) -> Optional[float]:
 
 def discover_liquid_usdt_symbols(
     client: "BinancePublicClient",
-    max_symbols: int = 10,
+    max_symbols: Optional[int] = None,
     min_quote_volume_usdt: float = MIN_QUOTE_VOLUME_USDT,
 ) -> List[str]:
     """
@@ -197,8 +197,11 @@ def discover_liquid_usdt_symbols(
       - malformed/missing quoteVolume → excluded (fails closed)
 
     Returns:
-        List of symbol strings, deduplicated, sorted alphabetically,
-        capped at max_symbols.
+        List of symbol strings, deduplicated, sorted alphabetically.
+        When max_symbols is None, every eligible symbol is returned
+        (no arbitrary truncation). When max_symbols is an int > 0, the
+        top max_symbols by 24h quoteVolume (descending) are selected and
+        then sorted alphabetically for deterministic output.
 
     Raises:
         ValueError: if exchangeInfo or ticker responses are structurally
@@ -290,8 +293,12 @@ def discover_liquid_usdt_symbols(
     # so the selection is deterministic regardless of input order.
     ranked.sort(key=lambda item: (-item[1], item[0]))
 
-    top_n = ranked[:max_symbols]
-    selected = sorted([sym for sym, _qv in top_n])
+    # When max_symbols is None, every eligible symbol is returned (no
+    # arbitrary truncation). Otherwise select the top max_symbols by
+    # 24h quoteVolume, then sort alphabetically for deterministic output.
+    if max_symbols is not None:
+        ranked = ranked[:max_symbols]
+    selected = sorted([sym for sym, _qv in ranked])
     return selected
 
 

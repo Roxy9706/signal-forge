@@ -84,8 +84,42 @@ from indicators.d15_decision import d15_final_decision
 # P5 Configuration
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Signal-only boundary (fail closed)
+# ---------------------------------------------------------------------------
+# SignalForge must remain SIGNAL-GENERATION ONLY.
+# This module reads Binance public market data and generates LONG/SHORT/NO_TRADE
+# signals with exact Entry, SL, TP, R:R, score, symbol, and timestamp. It does
+# NOT place, cancel, or modify orders; does NOT access the Demo account; does
+# NOT require Binance API credentials.
+#
+# The ONLY bridge to execution/ is file-based: execution/demo_auto.py can
+# consume the output file below (data/signals/paper_trade.jsonl) when
+# DEMO_AUTO_TRADE=true. For signal-only operation, do NOT run demo_auto.py
+# against this file and do NOT set DEMO_AUTO_TRADE=true.
+#
 # Hard cap on symbol-level fetch concurrency (validated benchmark: c=2).
 # Values above this are clamped/fail-closed — never spawn more workers.
+_MAX_EXECUTION_MODULE_NAMES = frozenset({
+    "execution", "execution.demo_auto", "execution.demo_orders",
+    "execution.ledger", "execution.demo_client", "execution.risk",
+    "execution.config", "execution.models", "execution.precision",
+})
+
+def _assert_no_execution_import() -> None:
+    """Fail closed if any execution module is already loaded in the process."""
+    loaded = set(sys.modules.keys())
+    breached = sorted(
+        n for n in loaded
+        if n in _MAX_EXECUTION_MODULE_NAMES or n.startswith("execution.")
+    )
+    if breached:
+        raise SystemExit(
+            "SignalForge scanner refuses to run with execution modules loaded "
+            f"(loaded: {breached}). Restart in a clean process."
+        )
+
+
 MAX_FETCH_CONCURRENCY = 2
 
 # Cap for the AUTO-DISCOVERY universe only (approved expansion; validated
@@ -93,7 +127,16 @@ MAX_FETCH_CONCURRENCY = 2
 # 0×429, peak weight 932/2400, 53% headroom before the 300s boundary).
 # The manual --symbols safety slice stays governed by MAX_SYMBOLS = 10
 # (imported from binance.market_data) and is NOT affected by this value.
-AUTO_DISCOVERY_MAX_SYMBOLS = 75
+AUTO_DISCOVERY_MAX_SYMBOLS: Optional[int] = None
+"""Auto-discovery universe cap.
+
+None = no arbitrary truncation; every USDT-M perpetual that passes the
+existing eligibility rules (TRADING, quoteAsset=USDT, PERPETUAL,
+underlyingType=COIN guard, exclusions, 24h quoteVolume >= 50M USDT) is
+returned. The manual --symbols safety slice is still governed by
+MAX_SYMBOLS = 10 (imported from binance.market_data) and is NOT affected
+by this value.
+"""
 
 
 @dataclass
@@ -590,9 +633,9 @@ class PaperObserver:
         existing_ids = set(all_signal_ids)
         open_events = self.get_open_signal_events()
 
-        # Circuit breaker: intentionally independent of the expanded
-        # auto-discovery universe (AUTO_DISCOVERY_MAX_SYMBOLS=75).  A wider
-        # universe raises the odds of reaching it; exceeding 50 open signals
+        # Circuit breaker: intentionally independent of the auto-discovery
+        # universe.  A wider universe raises the odds of reaching it;
+        # exceeding 50 open signals
         # fails the cycle CLOSED (no processing), by design.
         if len(open_events) > self.config.max_open_signals:
             summary["errors"]["too_many_open"] = f"open signals ({len(open_events)}) exceed max ({self.config.max_open_signals})"
@@ -1111,6 +1154,7 @@ def cmd_summary(args) -> None:
 
 
 def main() -> None:
+    _assert_no_execution_import()
     parser = build_parser()
     args = parser.parse_args()
 

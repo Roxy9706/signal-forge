@@ -4,7 +4,7 @@
 #   - exchangeInfo filtering (status, quoteAsset, excludes, leveraged tokens)
 #   - 24h ticker liquidity gate (quoteVolume >= 50,000,000 USDT)
 #   - malformed / missing quoteVolume fails closed
-#   - deduplication, alphabetical ordering, MAX_SYMBOLS cap
+#   - deduplication, alphabetical ordering, top-N by volume (when capped)
 #   - discovery failure propagation (no silent fallback)
 #   - PaperObserver integration (discovery honours existing symbols when used warm)
 #   - no private API / order endpoints touched
@@ -279,8 +279,9 @@ class TestPassesExchangeInfoFilters(unittest.TestCase):
 
     def test_max_symbols_constant_unchanged(self):
         """Regression 9: manual-list cap MAX_SYMBOLS remains 10 (the
-        auto-discovery universe cap lives in scanner.AUTO_DISCOVERY_MAX_SYMBOLS
-        and is pinned separately in tests/test_scanner_concurrency.py)."""
+        Termux safety cap for manual --symbols). Auto-discovery has no arbitrary
+        truncation; the cap lives in scanner.AUTO_DISCOVERY_MAX_SYMBOLS
+        and is pinned in tests/test_scanner_concurrency.py."""
         self.assertEqual(MAX_SYMBOLS, 10)
 
     def test_underlying_type_equity_rejected(self):
@@ -984,3 +985,174 @@ class TestCmdPaperDefaultMode(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+class TestDiscoverNoArbitraryTruncation(unittest.TestCase):
+    """Auto-discovery returns EVERY eligible symbol when max_symbols is None.
+    No arbitrary 75-symbol cap; the full eligible universe is returned.
+    """
+
+    def setUp(self):
+        self.fake = _FakeUrlopen()
+        self.fake.install()
+        self.addCleanup(self.fake.uninstall)
+
+    def _client(self) -> BinancePublicClient:
+        return BinancePublicClient(timeout_sec=10, max_retries=1, backoff_base_sec=1)
+
+    def test_no_cap_returns_all_eligible(self):
+        """max_symbols=None (default) returns every symbol that passes filters."""
+        # 12 eligible symbols, all above volume threshold.
+        exch = _exchange_info([
+            {"symbol": f"{name}USDT", "status": "TRADING", "quoteAsset": "USDT",
+             "contractType": "PERPETUAL", "underlyingType": "COIN"}
+            for name in [
+                "BTC", "ETH", "SOL", "BNB", "XRP", "ADA", "DOGE",
+                "AVAX", "MATIC", "LINK", "ATOM", "UNI",
+            ]
+        ])
+        tickers = _ticker_all([
+            _make_ticker(f"{name}USDT", 200_000_000)
+            for name in [
+                "BTC", "ETH", "SOL", "BNB", "XRP", "ADA", "DOGE",
+                "AVAX", "MATIC", "LINK", "ATOM", "UNI",
+            ]
+        ])
+        self.fake.set_responses([exch, tickers])
+        syms = discover_liquid_usdt_symbols(self._client())
+        self.assertEqual(len(syms), 12,
+                         "when uncapped, every eligible symbol must be returned")
+        self.assertIn("BTCUSDT", syms)
+        self.assertIn("UNIUSDT", syms)
+
+    def test_explicit_cap_still_works(self):
+        """When max_symbols is an int, top-N selection still works."""
+        exch = _exchange_info([
+            {"symbol": f"{name}USDT", "status": "TRADING", "quoteAsset": "USDT",
+             "contractType": "PERPETUAL", "underlyingType": "COIN"}
+            for name in ["A", "B", "C", "D", "E"]
+        ])
+        # Volumes: B > D > A > E > C
+        tickers = _ticker_all([
+            _make_ticker("AUSDT", 200_000_000),
+            _make_ticker("BUSDT", 500_000_000),
+            _make_ticker("CUSDT", 100_000_000),
+            _make_ticker("DUSDT", 300_000_000),
+            _make_ticker("EUSDT", 150_000_000),
+        ])
+        self.fake.set_responses([exch, tickers])
+        syms = discover_liquid_usdt_symbols(self._client(), max_symbols=3)
+        # Top 3 by volume: B (500M), D (300M), A (200M).
+        self.assertEqual(syms, ["AUSDT", "BUSDT", "DUSDT"])
+
+    def test_zero_max_symbols_returns_empty(self):
+        """max_symbols=0 returns no symbols (degenerate, but well-defined)."""
+        exch = _exchange_info([
+            {"symbol": "BTCUSDT", "status": "TRADING", "quoteAsset": "USDT",
+             "contractType": "PERPETUAL", "underlyingType": "COIN"},
+        ])
+        tickers = _ticker_all([
+            _make_ticker("BTCUSDT", 200_000_000),
+        ])
+        self.fake.set_responses([exch, tickers])
+        syms = discover_liquid_usdt_symbols(self._client(), max_symbols=0)
+        self.assertEqual(syms, [])
+
+    def test_none_is_the_default(self):
+        """Calling without max_symbols is equivalent to max_symbols=None."""
+        exch = _exchange_info([
+            {"symbol": "BTCUSDT", "status": "TRADING", "quoteAsset": "USDT",
+             "contractType": "PERPETUAL", "underlyingType": "COIN"},
+            {"symbol": "ETHUSDT", "status": "TRADING", "quoteAsset": "USDT",
+             "contractType": "PERPETUAL", "underlyingType": "COIN"},
+        ])
+        tickers = _ticker_all([
+            _make_ticker("BTCUSDT", 200_000_000),
+            _make_ticker("ETHUSDT", 150_000_000),
+        ])
+        # Use separate fake instances so each discovery call gets its own
+        # exchangeInfo + ticker pair (each call consumes 2 responses).
+        fake_a = _FakeUrlopen()
+        fake_a.set_responses([exch, tickers])
+        fake_a.install()
+        syms_default = discover_liquid_usdt_symbols(self._client())
+        fake_a.uninstall()
+
+        fake_b = _FakeUrlopen()
+        fake_b.set_responses([exch, tickers])
+        fake_b.install()
+        syms_explicit = discover_liquid_usdt_symbols(self._client(), max_symbols=None)
+        fake_b.uninstall()
+
+        self.assertEqual(syms_default, syms_explicit)
+        self.assertEqual(syms_default, ["BTCUSDT", "ETHUSDT"])
+
+    def test_volumes_preserved_when_uncapped(self):
+        """Every eligible symbol, regardless of volume rank, appears when uncapped."""
+        exch = _exchange_info([
+            {"symbol": f"{name}USDT", "status": "TRADING", "quoteAsset": "USDT",
+             "contractType": "PERPETUAL", "underlyingType": "COIN"}
+            for name in ["LOW", "MID", "HIGH"]
+        ])
+        # LOW has the lowest volume, HIGH has the highest.
+        tickers = _ticker_all([
+            _make_ticker("LOWUSDT", 60_000_000),
+            _make_ticker("MIDUSDT", 100_000_000),
+            _make_ticker("HIGHUSDT", 500_000_000),
+        ])
+        self.fake.set_responses([exch, tickers])
+        syms = discover_liquid_usdt_symbols(self._client())
+        # All three are eligible (above 50M threshold); all three returned.
+        self.assertEqual(syms, ["HIGHUSDT", "LOWUSDT", "MIDUSDT"])
+
+
+class TestDiscoverNoArbitraryTruncationRegression(unittest.TestCase):
+    """Regression: the old 75-symbol cap must not silently apply."""
+
+    def setUp(self):
+        self.fake = _FakeUrlopen()
+        self.fake.install()
+        self.addCleanup(self.fake.uninstall)
+
+    def _client(self) -> BinancePublicClient:
+        return BinancePublicClient(timeout_sec=10, max_retries=1, backoff_base_sec=1)
+
+    def test_76_eligible_symbols_all_returned(self):
+        """If 76 symbols pass all filters, all 76 are returned (not truncated to 75)."""
+        # Generate 76 eligible symbols with unique volumes.
+        names = [f"S{i:02d}" for i in range(76)]  # S00..S75
+        exch = _exchange_info([
+            {"symbol": f"{n}USDT", "status": "TRADING", "quoteAsset": "USDT",
+             "contractType": "PERPETUAL", "underlyingType": "COIN"}
+            for n in names
+        ])
+        # Give each a distinct volume so ranking is deterministic.
+        tickers = _ticker_all([
+            _make_ticker(f"{n}USDT", 100_000_000 + i * 1_000_000)
+            for i, n in enumerate(names)
+        ])
+        self.fake.set_responses([exch, tickers])
+        syms = discover_liquid_usdt_symbols(self._client())
+        self.assertEqual(len(syms), 76,
+                         f"expected all 76 eligible symbols, got {len(syms)}")
+        # Verify the lowest-volume symbol (S00) is still present.
+        self.assertIn("S00USDT", syms)
+        # Verify the highest-volume symbol (S75) is still present.
+        self.assertIn("S75USDT", syms)
+
+    def test_100_eligible_symbols_all_returned(self):
+        """If 100 symbols pass all filters, all 100 are returned."""
+        names = [f"PAIR{i:03d}" for i in range(100)]
+        exch = _exchange_info([
+            {"symbol": f"{n}USDT", "status": "TRADING", "quoteAsset": "USDT",
+             "contractType": "PERPETUAL", "underlyingType": "COIN"}
+            for n in names
+        ])
+        tickers = _ticker_all([
+            _make_ticker(f"{n}USDT", 200_000_000)
+            for n in names
+        ])
+        self.fake.set_responses([exch, tickers])
+        syms = discover_liquid_usdt_symbols(self._client())
+        self.assertEqual(len(syms), 100,
+                         f"expected all 100 eligible symbols, got {len(syms)}")

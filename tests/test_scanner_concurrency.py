@@ -168,12 +168,14 @@ class TestFetchConcurrency(unittest.TestCase):
         from binance.market_data import MAX_SYMBOLS
         self.assertEqual(MAX_SYMBOLS, 10)
 
-    def test_auto_discovery_cap_is_exactly_75(self):
-        """Approved universe-cap expansion: auto-discovery cap == 75, and it
-        is a distinct constant from the manual-list cap."""
+    def test_auto_discovery_cap_is_unlimited(self):
+        """Approved universe-cap removal: auto-discovery cap is None (no
+        arbitrary truncation). It is a distinct constant from the
+        manual-list cap MAX_SYMBOLS=10.
+        """
         from binance.market_data import MAX_SYMBOLS
-        self.assertEqual(scanner.AUTO_DISCOVERY_MAX_SYMBOLS, 75)
-        self.assertNotEqual(scanner.AUTO_DISCOVERY_MAX_SYMBOLS, MAX_SYMBOLS)
+        self.assertIsNone(scanner.AUTO_DISCOVERY_MAX_SYMBOLS)
+        self.assertEqual(MAX_SYMBOLS, 10)
 
     def test_max_open_signals_remains_50(self):
         """Open-signal circuit breaker is intentionally independent of the
@@ -182,9 +184,10 @@ class TestFetchConcurrency(unittest.TestCase):
         self.assertEqual(MAX_OPEN_SIGNALS, 50)
         self.assertEqual(P5Config().max_open_signals, 50)
 
-    def test_cmd_paper_auto_discovery_requests_cap_75(self):
-        """cmd_paper with no --symbols must pass max_symbols=
-        AUTO_DISCOVERY_MAX_SYMBOLS to the production discovery function."""
+    def test_cmd_paper_auto_discovery_passes_no_cap(self):
+        """cmd_paper with no --symbols must pass max_symbols=None (no arbitrary
+        truncation) to the production discovery function.
+        """
         from unittest.mock import patch as upatch
         import argparse
         captured = {}
@@ -200,9 +203,9 @@ class TestFetchConcurrency(unittest.TestCase):
         with upatch("binance.contracts.discover_liquid_usdt_symbols",
                     side_effect=fake_discover):
             scanner.cmd_paper(ns)
-        self.assertEqual(captured.get("max_symbols"),
-                         scanner.AUTO_DISCOVERY_MAX_SYMBOLS)
-        self.assertEqual(captured.get("max_symbols"), 75)
+        self.assertIsNone(captured.get("max_symbols"),
+                          "auto-discovery must pass max_symbols=None (no cap)")
+        self.assertEqual(captured.get("max_symbols"), None)
 
     def test_cmd_paper_manual_symbols_still_capped_at_10(self):
         """Manual --symbols path truncates at MAX_SYMBOLS=10, NOT the new
