@@ -13,10 +13,12 @@
 # Runs under the existing P5 test suite via pytest/unittest.
 
 from __future__ import annotations
+import os
 import sys
 import json
 import unittest
 import urllib.error
+import tempfile
 from typing import List, Dict, Any, Optional
 from pathlib import Path
 
@@ -867,6 +869,13 @@ class TestCmdPaperDefaultMode(unittest.TestCase):
         self._fake.install()
         # Canned exchangeInfo + ticker that yield a small liquid set.
         self._liquid_symbols = ["BTCUSDT", "ETHUSDT", "SOLUSDT"]
+        # Temp JSONL log so cmd_paper's scanner-lock acquisition does not
+        # contend with the real data/signals/paper_trade.jsonl lock.
+        self._tmp_log = tempfile.NamedTemporaryFile(
+            suffix=".jsonl", delete=False, dir=tempfile.gettempdir()
+        )
+        self._tmp_log.close()
+        self._log_path = self._tmp_log.name
         self._fake.set_responses([
             _exchange_info([
                 {"symbol": "BTCUSDT", "status": "TRADING", "quoteAsset": "USDT", "contractType": "PERPETUAL", "underlyingType": "COIN"},
@@ -884,6 +893,10 @@ class TestCmdPaperDefaultMode(unittest.TestCase):
 
     def tearDown(self):
         self._fake.uninstall()
+        try:
+            os.unlink(self._log_path)
+        except OSError:
+            pass
 
     def _parse_args(self, argv: List[str]) -> Any:
         from scanner import build_parser
@@ -892,6 +905,8 @@ class TestCmdPaperDefaultMode(unittest.TestCase):
         # immediately instead of hanging the test.
         if "--max-cycles" not in argv:
             argv = argv + ["--max-cycles", "0"]
+        if "--log" not in argv:
+            argv = argv + ["--log", self._log_path]
         return parser.parse_args(argv)
 
     def _run_cmd_paper(self, args: Any) -> None:

@@ -1,0 +1,667 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<title>SignalForge Dashboard</title>
+<style>
+/* Mobile-first reset - no framework */
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+html { font-size: 16px; -webkit-text-size-adjust: 100%; }
+body {
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+  background: #0a0e17;
+  color: #e1e5eb;
+  line-height: 1.5;
+  min-height: 100vh;
+  padding: 0;
+  overflow-x: hidden;
+}
+.container { max-width: 480px; margin: 0 auto; padding: 12px 14px 60px; }
+
+/* Header */
+.header {
+  background: linear-gradient(135deg, #1a1f2e 0%, #0f1320 100%);
+  border-bottom: 1px solid #2a3444;
+  padding: 14px 16px;
+  margin-bottom: 16px;
+  position: sticky;
+  top: 0;
+  z-index: 10;
+}
+.header h1 {
+  font-size: 1.25rem;
+  font-weight: 700;
+  color: #f0f3f8;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.header .badge {
+  font-size: 0.65rem;
+  background: #2a3444;
+  color: #8892a4;
+  padding: 2px 6px;
+  border-radius: 4px;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+}
+.header .sub {
+  font-size: 0.75rem;
+  color: #6b7a8f;
+  margin-top: 4px;
+  display: flex;
+  justify-content: space-between;
+}
+
+/* Status bar */
+.status-bar {
+  background: #141a26;
+  border: 1px solid #2a3444;
+  border-radius: 8px;
+  padding: 12px;
+  margin-bottom: 16px;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+.status-indicator {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.status-dot {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+.status-dot.running { background: #22c55e; box-shadow: 0 0 6px #22c55e; }
+.status-dot.stopped { background: #ef4444; box-shadow: 0 0 6px #ef4444; }
+.status-dot.unknown { background: #6b7280; box-shadow: 0 0 6px #6b7280; }
+.status-text {
+  font-size: 0.85rem;
+  font-weight: 600;
+}
+.status-text.running { color: #22c55e; }
+.status-text.stopped { color: #ef4444; }
+.status-text.unknown { color: #6b7280; }
+.status-meta {
+  font-size: 0.7rem;
+  color: #6b7a8f;
+  text-align: right;
+}
+
+/* Section */
+.section {
+  background: #141a26;
+  border: 1px solid #2a3444;
+  border-radius: 8px;
+  margin-bottom: 16px;
+  overflow: hidden;
+}
+.section-header {
+  padding: 10px 14px;
+  background: #1a2030;
+  border-bottom: 1px solid #2a3444;
+  font-size: 0.85rem;
+  font-weight: 600;
+  color: #c4cdd9;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+.section-header .count {
+  font-size: 0.7rem;
+  background: #2a3444;
+  color: #8892a4;
+  padding: 2px 8px;
+  border-radius: 10px;
+}
+
+/* Signal card */
+.signal-card {
+  padding: 12px 14px;
+  border-bottom: 1px solid #1a2030;
+}
+.signal-card:last-child { border-bottom: none; }
+
+.signal-card.short {
+  background: linear-gradient(90deg, rgba(239,68,68,0.08) 0%, rgba(239,68,68,0.02) 100%);
+  border-left: 3px solid #ef4444;
+}
+.signal-card.long {
+  background: linear-gradient(90deg, rgba(34,197,94,0.08) 0%, rgba(34,197,94,0.02) 100%);
+  border-left: 3px solid #22c55e;
+}
+
+.signal-top {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  margin-bottom: 8px;
+}
+.signal-symbol {
+  font-size: 1.1rem;
+  font-weight: 700;
+  color: #f0f3f8;
+}
+.signal-direction {
+  font-size: 0.75rem;
+  font-weight: 700;
+  padding: 3px 8px;
+  border-radius: 4px;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+}
+.signal-direction.long { background: #22c55e15; color: #22c55e; }
+.signal-direction.short { background: #ef444415; color: #ef4444; }
+
+.signal-stats {
+  display: grid;
+  grid-template-columns: 1fr 1fr 1fr 1fr;
+  gap: 6px;
+  margin-top: 8px;
+}
+.signal-stat {
+  background: #0f1320;
+  border-radius: 6px;
+  padding: 6px 8px;
+  text-align: center;
+}
+.signal-stat-label {
+  font-size: 0.6rem;
+  color: #6b7a8f;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  margin-bottom: 2px;
+}
+.signal-stat-value {
+  font-size: 0.85rem;
+  font-weight: 600;
+  color: #e1e5eb;
+  font-family: "SF Mono", "Roboto Mono", monospace;
+}
+.signal-stat-value.entry { color: #60a5fa; }
+.signal-stat-value.sl { color: #f87171; }
+.signal-stat-value.tp { color: #34d399; }
+.signal-stat-value.rr { color: #fbbf24; }
+.signal-stat-value.score { color: #a78bfa; }
+
+.signal-bottom {
+  display: flex;
+  justify-content: space-between;
+  font-size: 0.7rem;
+  color: #6b7a8f;
+  margin-top: 8px;
+}
+
+/* Empty state */
+.empty-state {
+  padding: 30px 16px;
+  text-align: center;
+}
+.empty-state .icon {
+  font-size: 2rem;
+  margin-bottom: 12px;
+  opacity: 0.5;
+}
+.empty-state .text {
+  font-size: 0.85rem;
+  color: #6b7a8f;
+}
+
+/* Cycle stats */
+.cycle-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px;
+  padding: 12px 14px;
+}
+.cycle-stat {
+  background: #0f1320;
+  border-radius: 6px;
+  padding: 8px;
+  text-align: center;
+}
+.cycle-stat-label {
+  font-size: 0.6rem;
+  color: #6b7a8f;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  margin-bottom: 2px;
+}
+.cycle-stat-value {
+  font-size: 0.9rem;
+  font-weight: 600;
+  color: #e1e5eb;
+}
+.cycle-stat-value.good { color: #22c55e; }
+
+/* Refresh indicator */
+.refresh-indicator {
+  position: fixed;
+  bottom: 16px;
+  left: 50%;
+  transform: translateX(-50%);
+  background: #1a2030;
+  border: 1px solid #2a3444;
+  border-radius: 20px;
+  padding: 8px 16px;
+  font-size: 0.7rem;
+  color: #6b7a8f;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  opacity: 0;
+  transition: opacity 0.3s;
+}
+.refresh-indicator.visible { opacity: 1; }
+.refresh-indicator .dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: #22c55e;
+  animation: pulse 1.5s infinite;
+}
+@keyframes pulse {
+  0%, 100% { opacity: 0.4; }
+  50% { opacity: 1; }
+}
+
+/* Footer */
+.footer {
+  text-align: center;
+  font-size: 0.65rem;
+  color: #4b5563;
+  padding: 8px;
+  border-top: 1px solid #1a2030;
+  margin-top: 16px;
+}
+
+/* Scrollbar */
+::-webkit-scrollbar { width: 4px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: #2a3444; border-radius: 2px; }
+
+/* Touch targets */
+button, a { touch-action: manipulation; }
+</style>
+</head>
+<body>
+<div class="container">
+  <header class="header">
+    <h1>SignalForge <span class="badge">readonly</span></h1>
+    <div class="sub">
+      <span id="lastUpdateLabel">—</span>
+      <span id="symbolCountLabel">— symbols</span>
+    </div>
+  </header>
+
+  <div id="statusBar" class="status-bar">
+    <div class="status-indicator">
+      <span id="statusDot" class="status-dot unknown"></span>
+      <span id="statusText" class="status-text unknown">Loading…</span>
+    </div>
+    <div class="status-meta" id="statusMeta">—</div>
+  </div>
+
+  <div id="scannerStatusSection" class="section" style="display:none;">
+    <div class="section-header">
+      <span>Scanner Status</span>
+      <span id="scannerStatusBadge" class="count">—</span>
+    </div>
+    <div id="scannerStatusContent"></div>
+  </div>
+
+  <div id="activeSignalsSection" class="section" style="display:none;">
+    <div class="section-header">
+      <span>Active Signals</span>
+      <span id="activeCount" class="count">0</span>
+    </div>
+    <div id="activeSignalsList"></div>
+  </div>
+
+  <div id="noSignalBanner" class="section" style="display:none;">
+    <div class="empty-state">
+      <div class="icon">📡</div>
+      <div class="text">No active signals at this moment.<br>New signals appear automatically when the scanner finds a setup.</div>
+    </div>
+  </div>
+
+  <div id="recentSection" class="section">
+    <div class="section-header">
+      <span>Recent Signals</span>
+      <span id="recentCount" class="count">0</span>
+    </div>
+    <div id="recentSignalsList"></div>
+  </div>
+
+  <div id="historySection" class="section" style="display:none;">
+    <div class="section-header">
+      <span>Outcome History</span>
+      <span id="outcomeCount" class="count">0</span>
+    </div>
+    <div id="outcomeList"></div>
+  </div>
+
+  <div class="footer">
+    Read-only dashboard · Data from JSONL · No API keys stored · GET-only Binance public data
+  </div>
+</div>
+
+<div id="refreshIndicator" class="refresh-indicator">
+  <span class="dot"></span>
+  <span>Refreshing…</span>
+</div>
+
+<script>
+const LOG_PATH = window.__LOG_PATH__ || 'data/signals/paper_trade.jsonl';
+const REFRESH_INTERVAL_MS = 15000;
+const POLL_INTERVAL = 15000;
+
+let lastActiveHash = '';
+let lastRecentHash = '';
+let lastOutcomeHash = '';
+
+function hashData(data) {
+  let s = JSON.stringify(data);
+  let h = 0;
+  for (let i = 0; i < s.length; i++) {
+    h = ((h << 5) - h) + s.charCodeAt(i);
+    h |= 0;
+  }
+  return h;
+}
+
+function signalAge(signalTime) {
+  const now = Date.now();
+  const age = now - signalTime;
+  if (age < 60000) return Math.floor(age/1000) + 's ago';
+  if (age < 3600000) return Math.floor(age/60000) + 'm ago';
+  if (age < 86400000) return Math.floor(age/3600000) + 'h ago';
+  return Math.floor(age/86400000) + 'd ago';
+}
+
+function formatPrice(p) {
+  // Safe decimal formatting: more decimals for smaller prices so Entry/SL/TP
+  // stay distinguishable for low-value symbols (e.g. SOONUSDT ~0.40).
+  // Does NOT round all prices to 2 decimals and does NOT alter stored values.
+  if (p == null || isNaN(p)) return '—';
+  const abs = Math.abs(p);
+  let decimals;
+  if (abs >= 1000) decimals = 2;
+  else if (abs >= 1) decimals = 4;
+  else if (abs >= 0.01) decimals = 6;
+  else decimals = 8;
+  return p.toFixed(decimals);
+}
+
+function formatMs(ms) {
+  if (ms === undefined || ms === null) return '—';
+  if (ms < 1000) return ms + 'ms';
+  if (ms < 60000) return (ms/1000).toFixed(1) + 's';
+  if (ms < 3600000) return (ms/60000).toFixed(1) + 'm';
+  return (ms/3600000).toFixed(2) + 'h';
+}
+
+function renderStatus(status) {
+  const dot = document.getElementById('statusDot');
+  const text = document.getElementById('statusText');
+  const meta = document.getElementById('statusMeta');
+  const lastUpdate = document.getElementById('lastUpdateLabel');
+  const symbolCount = document.getElementById('symbolCountLabel');
+
+  const state = status.state || 'unknown';
+  const running = status.running;
+
+  dot.className = 'status-dot ' + (running ? 'running' : (state === 'stopped' ? 'stopped' : 'unknown'));
+  text.className = 'status-text ' + (running ? 'running' : (state === 'stopped' ? 'stopped' : 'unknown'));
+  text.textContent = running ? 'Scanner Running' : (state === 'stopped' ? 'Scanner Stopped' : 'Status Unknown');
+
+  if (status.latest_cycle) {
+    const c = status.latest_cycle;
+    const ageMs = Date.now() - (c.poll_time_ms || Date.now());
+    const ageStr = ageMs < 60000 ? Math.floor(ageMs/1000) + 's ago' : Math.floor(ageMs/60000) + 'm ago';
+    meta.innerHTML =
+      'Cycle ' + (c.cycle_number || '—') +
+      ' · ' + (c.symbols_processed || 0) + ' processed' +
+      ' · ' + (c.signals_generated || 0) + ' signals' +
+      ' · ' + (c.error_symbol_count || 0) + ' errors' +
+      ' · last ' + ageStr;
+  } else {
+    meta.textContent = 'No cycles yet';
+  }
+
+  const age = status.last_update_age_s;
+  if (age !== null && age !== undefined) {
+    const ageStr = age < 60 ? Math.floor(age) + 's ago' : Math.floor(age/60) + 'm ago';
+    lastUpdate.textContent = 'Updated ' + ageStr;
+  } else {
+    lastUpdate.textContent = '—';
+  }
+  symbolCount.textContent = (status.symbol_count || 0) + ' symbols';
+}
+
+function renderScannerStatusSection(status) {
+  const section = document.getElementById('scannerStatusSection');
+  const content = document.getElementById('scannerStatusContent');
+  const badge = document.getElementById('scannerStatusBadge');
+  if (!status || !status.latest_cycle) {
+    section.style.display = 'none';
+    return;
+  }
+  section.style.display = '';
+  const c = status.latest_cycle;
+  const state = status.state || 'unknown';
+  const running = status.running;
+  const stateLabel = running ? 'RUNNING' : (state === 'stopped' ? 'STOPPED' : 'UNKNOWN');
+  const stateColor = running ? '#22c55e' : (state === 'stopped' ? '#ef4444' : '#6b7280');
+  const ageMs = Date.now() - (c.poll_time_ms || Date.now());
+  const ageStr = ageMs < 60000 ? Math.floor(ageMs/1000) + 's ago'
+    : ageMs < 3600000 ? Math.floor(ageMs/60000) + 'm ago'
+    : Math.floor(ageMs/3600000) + 'h ago';
+  badge.textContent = stateLabel;
+  badge.style.color = stateColor;
+  badge.style.background = '#2a3444';
+  content.innerHTML =
+    '<div class="cycle-grid">' +
+      cycleStatRow('State', stateLabel, stateColor === '#22c55e' ? 'good' : (stateColor === '#ef4444' ? '' : null)) +
+      cycleStatRow('Last Cycle', c.cycle_number || '—', null) +
+      cycleStatRow('Discovered', c.symbols_discovered || 0, null) +
+      cycleStatRow('Processed', c.symbols_processed || 0, c.symbols_processed > 0 ? 'good' : null) +
+      cycleStatRow('Signals', c.signals_generated || 0, c.signals_generated > 0 ? 'good' : null) +
+      cycleStatRow('Outcomes', c.outcomes_resolved || 0, null) +
+      cycleStatRow('Errors', c.error_symbol_count || 0, c.error_symbol_count === 0 ? 'good' : null) +
+      cycleStatRow('Data Quality', c.data_quality_events || 0, null) +
+      cycleStatRow('Duration', formatMs(c.scan_duration_ms || 0), null) +
+      cycleStatRow('Since', ageStr, null) +
+    '</div>' +
+    '<div style="font-size:0.65rem;color:#6b7a8f;padding:0 14px 10px;">' +
+      'Discovered ' + (status.symbols?.length || 0) + ' symbols · interval ' + (status.interval_sec || 0) + 's' +
+    '</div>';
+
+  function cycleStatRow(label, value, cls) {
+    return '<div class="cycle-stat"><div class="cycle-stat-label">' + label + '</div>' +
+      '<div class="cycle-stat-value' + (cls ? ' ' + cls : '') + '">' + value + '</div></div>';
+  }
+}
+
+function renderSignalCard(sig, isRecent) {
+  const div = document.createElement('div');
+  div.className = 'signal-card ' + (sig.direction === 'SHORT' ? 'short' : 'long');
+  div.innerHTML =
+    '<div class="signal-top">' +
+      '<span class="signal-symbol">' + (sig.symbol || '—') + '</span>' +
+      '<span class="signal-direction ' + (sig.direction === 'LONG' ? 'long' : 'short') + '">' + (sig.direction || '—') + '</span>' +
+    '</div>' +
+    '<div class="signal-stats">' +
+      '<div class="signal-stat"><div class="signal-stat-label">Score</div><div class="signal-stat-value score">' + (sig.score || 0).toFixed(1) + '</div></div>' +
+      '<div class="signal-stat"><div class="signal-stat-label">Entry</div><div class="signal-stat-value entry">' + formatPrice(sig.entry) + '</div></div>' +
+      '<div class="signal-stat"><div class="signal-stat-label">SL</div><div class="signal-stat-value sl">' + formatPrice(sig.sl) + '</div></div>' +
+      '<div class="signal-stat"><div class="signal-stat-label">TP</div><div class="signal-stat-value tp">' + formatPrice(sig.tp) + '</div></div>' +
+      '<div class="signal-stat"><div class="signal-stat-label">R:R</div><div class="signal-stat-value rr">' + (sig.rr || 0).toFixed(1) + '</div></div>' +
+    '</div>' +
+    '<div class="signal-bottom">' +
+      '<span>ID: ' + (sig.signal_id || '—') + '</span>' +
+      '<span>' + signalAge(sig.signal_time || 0) + '</span>' +
+    '</div>' +
+    '<div style="font-size:0.65rem;color:#6b7a8f;margin-top:6px;">Signal ' + new Date((sig.signal_time || 0)).toLocaleString() + '</div>';
+  return div;
+}
+
+function renderOutcomeCard(out) {
+  const div = document.createElement('div');
+  div.className = 'signal-card ' + (out.outcome === 'sl_hit' ? 'short' : (out.outcome === 'tp_hit' ? 'long' : ''));
+  const label = out.outcome === 'tp_hit' ? 'TP HIT' : (out.outcome === 'sl_hit' ? 'SL HIT' : 'EXPIRED');
+  const color = out.outcome === 'tp_hit' ? '#34d399' : (out.outcome === 'sl_hit' ? '#f87171' : '#fbbf24');
+  div.style.background = 'transparent';
+  div.style.borderLeft = '3px solid ' + color;
+  div.style.padding = '10px 14px';
+  div.style.marginBottom = '1px';
+  div.style.background = 'rgba(0,0,0,0.15)';
+  div.innerHTML =
+    '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px;">' +
+      '<span style="font-weight:700;font-size:0.85rem;">' + (out.symbol || '—') + '</span>' +
+      '<span style="font-size:0.65rem;font-weight:700;padding:2px 6px;border-radius:3px;background:' + color + '20;color:' + color + ';text-transform:uppercase;">' + label + '</span>' +
+    '</div>' +
+    '<div style="font-size:0.65rem;color:#6b7a8f;">' +
+      'ID: ' + (out.signal_id || '—') + ' · ' + (out.direction || '—') +
+    '</div>' +
+    '<div style="display:flex;justify-content:space-between;margin-top:6px;font-size:0.7rem;font-family:monospace;">' +
+      '<span style="color:#f87171;">Gross R: ' + (out.gross_r || 0).toFixed(2) + '</span>' +
+      '<span style="color:#34d399;">Net R: ' + (out.net_r || 0).toFixed(2) + '</span>' +
+      '<span>' + signalAge(out.outcome_time || 0) + '</span>' +
+    '</div>';
+  return div;
+}
+
+function renderCycleStats(cycle) {
+  if (!cycle) {
+    document.getElementById('recentSignalsList').innerHTML =
+      '<div class="empty-state"><div class="icon">📊</div><div class="text">No cycle data available.<br>Run the scanner to generate cycles.</div></div>';
+    return;
+  }
+  const grid = document.createElement('div');
+  grid.className = 'cycle-grid';
+  const items = [
+    ['Cycle', cycle.cycle_number || '—', null],
+    ['Discovered', cycle.symbols_discovered || 0, null],
+    ['Processed', cycle.symbols_processed || 0, cycle.symbols_processed > 0 ? 'good' : null],
+    ['Signals', cycle.signals_generated || 0, cycle.signals_generated > 0 ? 'good' : null],
+    ['Outcomes', cycle.outcomes_resolved || 0, null],
+    ['Errors', cycle.error_symbol_count || 0, cycle.error_symbol_count === 0 ? 'good' : null],
+    ['Data Quality', cycle.data_quality_events || 0, null],
+    ['Duration', formatMs(cycle.scan_duration_ms || 0), null],
+  ];
+  grid.innerHTML = items.map(([label, value, cls]) =>
+    '<div class="cycle-stat"><div class="cycle-stat-label">' + label + '</div>' +
+    '<div class="cycle-stat-value' + (cls ? ' ' + cls : '') + '">' + value + '</div></div>'
+  ).join('');
+  document.getElementById('recentSignalsList').appendChild(grid);
+}
+
+async function fetchApi(path) {
+  try {
+    const resp = await fetch(path);
+    if (!resp.ok) throw new Error('HTTP ' + resp.status);
+    return await resp.json();
+  } catch (e) {
+    console.error('API fetch failed:', e);
+    return null;
+  }
+}
+
+async function refresh() {
+  const indicator = document.getElementById('refreshIndicator');
+  indicator.classList.add('visible');
+  setTimeout(() => indicator.classList.remove('visible'), 1000);
+
+  const [status, signalsData, historyData] = await Promise.all([
+    fetchApi('/api/status'),
+    fetchApi('/api/signals'),
+    fetchApi('/api/history'),
+  ]);
+
+  if (status) {
+    renderStatus(status);
+    renderScannerStatusSection(status);
+  }
+
+  if (signalsData) {
+    const active = signalsData.active || [];
+    const recent = signalsData.recent || [];
+
+    // Active signals
+    const activeSection = document.getElementById('activeSignalsSection');
+    const activeList = document.getElementById('activeSignalsList');
+    const activeCount = document.getElementById('activeCount');
+    const noSignalBanner = document.getElementById('noSignalBanner');
+
+    const activeHash = hashData(active);
+    if (activeHash !== lastActiveHash) {
+      lastActiveHash = activeHash;
+      if (active.length > 0) {
+        activeSection.style.display = '';
+        noSignalBanner.style.display = 'none';
+        activeList.innerHTML = '';
+        active.forEach(sig => activeList.appendChild(renderSignalCard(sig, false)));
+        activeCount.textContent = active.length;
+      } else {
+        activeSection.style.display = 'none';
+        noSignalBanner.style.display = '';
+      }
+    }
+
+    // Recent signals
+    const recentSection = document.getElementById('recentSection');
+    const recentList = document.getElementById('recentSignalsList');
+    const recentCount = document.getElementById('recentCount');
+
+    if (recent.length > 0) {
+      recentSection.style.display = '';
+      const recentHash = hashData(recent);
+      if (recentHash !== lastRecentHash) {
+        lastRecentHash = recentHash;
+        recentList.innerHTML = '';
+        recent.slice(0, 8).forEach(sig => recentList.appendChild(renderSignalCard(sig, true)));
+        recentCount.textContent = recent.length;
+      }
+    } else {
+      recentSection.style.display = 'none';
+    }
+
+    // Outcomes
+    const historySection = document.getElementById('historySection');
+    const outcomeList = document.getElementById('outcomeList');
+    const outcomeCount = document.getElementById('outcomeCount');
+    const outcomes = historyData.outcomes || [];
+
+    if (outcomes.length > 0) {
+      historySection.style.display = '';
+      const outcomeHash = hashData(outcomes);
+      if (outcomeHash !== lastOutcomeHash) {
+        lastOutcomeHash = outcomeHash;
+        outcomeList.innerHTML = '';
+        outcomes.slice(0, 8).forEach(out => outcomeList.appendChild(renderOutcomeCard(out)));
+        outcomeCount.textContent = outcomes.length;
+      }
+    } else {
+      historySection.style.display = 'none';
+    }
+  }
+}
+
+// Initial load
+refresh();
+
+// Auto-refresh
+setInterval(refresh, REFRESH_INTERVAL_MS);
+
+// Refresh on focus (user returns to tab)
+document.addEventListener('visibilitychange', () => {
+  if (!document.hidden) refresh();
+});
+</script>
+</body>
+</html>

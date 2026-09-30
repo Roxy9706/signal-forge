@@ -250,22 +250,55 @@ def get_open_signals(log_path: str) -> List[Dict[str, Any]]:
 
 
 def get_recent_signals(log_path: str, limit: int = 20) -> List[Dict[str, Any]]:
-    """Get recent signal events, newest first."""
+    """Get recent signal events, newest first.
+
+    The scanner JSONL may contain duplicate ``signal`` lines for the same
+    ``signal_id`` (e.g. a re-emission during a scanner restart).  The
+    dashboard treats ``signal_id`` as the unique key and keeps only the
+    newest event per id so each signal appears once in Recent Signals.
+    Chronological (newest-first) ordering is preserved.
+    """
     events = _read_jsonl(log_path)
     signal_events = _find_events(events, "signal")
     signal_events.sort(key=lambda e: e.get("generated_at", 0), reverse=True)
-    return signal_events[:limit]
+    # Dedup by signal_id — keep the first (newest) occurrence.
+    seen: set[str] = set()
+    unique: List[Dict[str, Any]] = []
+    for e in signal_events:
+        sid = e.get("signal_id")
+        if not sid or sid in seen:
+            continue
+        seen.add(sid)
+        unique.append(e)
+    return unique[:limit]
 
 
 def get_recent_outcomes(log_path: str, limit: int = 20) -> List[Dict[str, Any]]:
-    """Get recent outcome events, newest first."""
+    """Get recent outcome events, newest first.
+
+    The scanner JSONL may contain duplicate outcome lines for the same
+    ``signal_id`` + ``outcome`` combination.  The dashboard treats the
+    ``(signal_id, outcome)`` pair as the unique key and keeps only the
+    newest event per pair so each resolved outcome appears once in Outcome
+    History.  Chronological (newest-first) ordering is preserved.
+    """
     events = _read_jsonl(log_path)
     outcome_types = ("tp_hit", "sl_hit", "expired")
     outcome_events: List[Dict[str, Any]] = []
     for et in outcome_types:
         outcome_events.extend(_find_events(events, et))
     outcome_events.sort(key=lambda e: e.get("outcome_time", 0), reverse=True)
-    return outcome_events[:limit]
+    # Dedup by (signal_id, outcome) — keep the first (newest) occurrence.
+    seen: set[tuple[str, str]] = set()
+    unique: List[Dict[str, Any]] = []
+    for e in outcome_events:
+        sid = e.get("signal_id")
+        out = e.get("outcome")
+        if not sid or not out or (sid, out) in seen:
+            continue
+        seen.add((sid, out))
+        unique.append(e)
+    return unique[:limit]
 
 
 def signal_age_label(signal_time_ms: int) -> str:

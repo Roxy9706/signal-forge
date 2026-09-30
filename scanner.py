@@ -34,6 +34,8 @@ import hashlib
 import argparse
 import concurrent.futures
 import datetime
+import os as _os
+import signal as _signal
 from typing import Any, Dict, List, Optional, Tuple, Iterable
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -69,6 +71,7 @@ from storage.jsonl import (
     jsonl_get_latest_processed_close_time,
     jsonl_count,
 )
+from scanner_lock import acquire_scanner_lock, release_scanner_lock
 from SignalForge.backtest.evaluator import (
     Candle,
     Signal,
@@ -759,8 +762,9 @@ class PaperObserver:
                 )
 
                 for outcome in outcomes:
-                    jsonl_append(self.log_path, outcome.to_dict())
-                    summary["outcomes_resolved"] += 1
+                    if not jsonl_has_outcome(self.log_path, outcome.signal_id):
+                        jsonl_append(self.log_path, outcome.to_dict())
+                        summary["outcomes_resolved"] += 1
 
         return summary
 
@@ -922,6 +926,7 @@ def build_parser() -> argparse.ArgumentParser:
 def cmd_paper(args) -> None:
     """Run the paper observation loop."""
     from binance.contracts import discover_liquid_usdt_symbols
+    from scanner_lock import acquire_scanner_lock, release_scanner_lock
 
     if args.symbols:
         # Explicit manual symbol list — skip auto-discovery.
@@ -978,7 +983,20 @@ def cmd_paper(args) -> None:
           f"interval={args.interval}s, log={args.log}")
     print("[P5] Mode: PAPER ONLY — NO orders, NO keys, NO private endpoints.")
     print("[P5] Press Ctrl+C to stop.")
-    observer.run_loop(max_cycles=args.max_cycles)
+
+    # Single-process guard: acquire the scanner lock before entering the loop.
+    # This protects direct `python scanner.py paper ...` usage and any runner-
+    # spawned scanner against concurrent execution.  The lock is held for the
+    # lifetime of the process and released on normal exit or SIGINT/SIGTERM.
+    # Guard here (not at module scope) so non-loop commands (show-open, etc.)
+    # are not blocked by the lock.
+    if not acquire_scanner_lock(args.log):
+        sys.exit(1)
+
+    try:
+        observer.run_loop(max_cycles=args.max_cycles)
+    finally:
+        release_scanner_lock()
 
 
 def cmd_show_open(args) -> None:
