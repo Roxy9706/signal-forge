@@ -698,6 +698,42 @@ class TestSignalAgeLabel:
         assert "now" in label
 
 
+class TestTemplateJsSignalAge:
+    """Regression tests for the browser-side signalAge() in index.html."""
+
+    _TEMPLATE_PATH = Path(__file__).resolve().parent.parent / "dashboard" / "templates" / "index.html"
+
+    def _js(self) -> str:
+        """Return the embedded template HTML as a string."""
+        assert self._TEMPLATE_PATH.exists(), f"Template not found: {self._TEMPLATE_PATH}"
+        return self._TEMPLATE_PATH.read_text(encoding="utf-8")
+
+    def test_template_contains_negative_age_guard(self) -> None:
+        """signalAge() must have a branch for age < 0 (future timestamps)."""
+        html = self._js()
+        assert "if (age < 0)" in html, (
+            "dashboard/templates/index.html signalAge() is missing a guard "
+            "for future timestamps (age < 0). Future outcome_time values will "
+            "render as negative 'Ns ago' strings."
+        )
+
+    def test_template_future_branch_formats_in_nunits(self) -> None:
+        """Future-timestamp branch must use 'in N' format, not 'Ns ago'."""
+        html = self._js()
+        # Extract the signalAge function body for a lightweight syntax check.
+        start = html.find("function signalAge(")
+        assert start != -1, "signalAge() function not found in template"
+        body = html[start:]
+        # The future branch must return strings starting with 'in '.
+        assert "'in '" in body or '"in "' in body, (
+            "signalAge() future branch does not produce 'in N units' labels."
+        )
+        # The past branch must still use 'ago' suffixes.
+        assert "'s ago'" in body or '"s ago"' in body, (
+            "signalAge() past branch lost its 's ago' suffix."
+        )
+
+
 # ---------------------------------------------------------------------------
 # Endpoint / data shape tests (lightweight, no live server)
 # ---------------------------------------------------------------------------

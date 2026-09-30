@@ -377,6 +377,13 @@ function hashData(data) {
 function signalAge(signalTime) {
   const now = Date.now();
   const age = now - signalTime;
+  if (age < 0) {
+    const abs = Math.abs(age);
+    if (abs < 60000) return 'in ' + Math.ceil(abs/1000) + 's';
+    if (abs < 3600000) return 'in ' + Math.ceil(abs/60000) + 'm';
+    if (abs < 86400000) return 'in ' + Math.ceil(abs/3600000) + 'h';
+    return 'in ' + Math.ceil(abs/86400000) + 'd';
+  }
   if (age < 60000) return Math.floor(age/1000) + 's ago';
   if (age < 3600000) return Math.floor(age/60000) + 'm ago';
   if (age < 86400000) return Math.floor(age/3600000) + 'h ago';
