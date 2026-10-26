@@ -137,7 +137,7 @@ class ExecutionConfig:
 
     def is_symbol_allowed(self, symbol: str) -> bool:
         """Check whether a symbol is in the allowlist."""
-        return isinstance(symbol, str) and symbol in self.symbol_allowlist
+        return isinstance(symbol, str) and str(symbol).upper() in [s.upper() for s in self.symbol_allowlist]
 
     def redacted_dict(self) -> dict:
         """Serialize config with credentials redacted (for logging/debug).

@@ -171,7 +171,7 @@ class P5Config:
 
     # Strategy
     strategy_version: str = ""
-    horizon_ms: int = 4 * 3600 * 1000  # 4 hours
+    horizon_ms: int = 12 * 3600 * 1000  # 4 hours
 
     # Fee/slippage (for P3 evaluator, net R calculation only)
     fee_pct: float = 0.001
@@ -561,7 +561,7 @@ class PaperObserver:
                 sl=d.get("sl", 0.0),
                 score=d.get("score", 0.0),
                 timeframe=d.get("timeframe", "5m"),
-                horizon_ms=d.get("horizon_ms", 4 * 3600 * 1000),
+                horizon_ms=d.get("horizon_ms", 12 * 3600 * 1000),
                 strategy_version=d.get("strategy_version", ""),
                 generated_at=d.get("generated_at", 0),
             ))

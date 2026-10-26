@@ -1,1 +1,9 @@
 # Config; weights 25/25/20/20/10; score formula 40/20/20/20; ATR spike 3x configurable
+TIMEFRAME_WEIGHTS = {"1d": 0.25, "4h": 0.25, "1h": 0.20, "15m": 0.20, "5m": 0.10}
+COMPONENT_WEIGHTS = {"trend": 0.40, "momentum": 0.20, "structure": 0.20, "volume": 0.20}
+DIRECTION_GATE_THRESHOLD = 65.0
+DEFAULT_ATR_BUFFER_MULT = 1.2
+DEFAULT_MIN_RR = 2.0
+DEFAULT_HORIZON_MS = 12 * 3600 * 1000
+DEFAULT_RISK_USD_PER_TRADE = 0.25
+DEFAULT_MAX_NOTIONAL_USD = 10.0

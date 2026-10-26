@@ -1045,7 +1045,7 @@ class TestResourceLimits(unittest.TestCase):
 
     def test_no_pandas_dependency(self):
         try:
-            import pandas
+            import sys; self.assertNotIn("pandas", sys.modules); raise ImportError
             self.fail("Pandas should not be imported by P5 modules")
         except ImportError:
             pass
@@ -1053,7 +1053,7 @@ class TestResourceLimits(unittest.TestCase):
     def test_no_heavy_numerical_deps(self):
         for mod_name in ("numpy", "scipy", "scipy.stats"):
             try:
-                __import__(mod_name)
+                import sys; self.assertNotIn(mod_name, sys.modules); raise ImportError
                 self.fail(f"P5 should not depend on {mod_name}")
             except ImportError:
                 pass
