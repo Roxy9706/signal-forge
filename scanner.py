@@ -468,6 +468,9 @@ class PaperEvaluator:
                 slippage_pct=self.config.slippage_pct,
             )
 
+            if result.outcome == "EXPIRATION" and not has_reach_horizon:
+                continue
+
             # Determine close_time for the outcome event
             if result.touch_timestamp is not None:
                 outcome_close_time = result.touch_timestamp
