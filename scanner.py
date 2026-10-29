@@ -184,7 +184,7 @@ class P5Config:
     min_quote_volume_usdt: float = MIN_QUOTE_VOLUME_USDT
 
     # Safety
-    max_open_signals: int = 500
+    max_open_signals: int = MAX_OPEN_SIGNALS
 
     # Stale data
     stale_max_age_ms: int = 2 * 300 * 1000  # 2 x 5m candles
@@ -981,6 +981,7 @@ def cmd_paper(args) -> None:
         log_path=args.log,
         strategy_version=make_strategy_version(),
     )
+    config.max_open_signals = 500
     observer = PaperObserver(config)
     print(f"[P5] Starting paper observation: {len(config.symbols)} symbols, "
           f"interval={args.interval}s, log={args.log}")
