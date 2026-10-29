@@ -185,6 +185,7 @@ class P5Config:
 
     # Safety
     max_open_signals: int = MAX_OPEN_SIGNALS
+    min_signal_score: float = 65.0
 
     # Stale data
     stale_max_age_ms: int = 2 * 300 * 1000  # 2 x 5m candles
@@ -752,6 +753,7 @@ class PaperObserver:
                 existing_signal_ids=existing_ids,
             )
 
+            new_signals = [s for s in new_signals if s.score >= getattr(self.config, "min_signal_score", 65.0)]
             for sig_event in new_signals:
                 jsonl_append(self.log_path, sig_event.to_dict())
                 existing_ids.add(sig_event.signal_id)
@@ -989,6 +991,7 @@ def cmd_paper(args) -> None:
         strategy_version=make_strategy_version(),
     )
     config.max_open_signals = 500
+    config.min_signal_score = 80.0
     observer = PaperObserver(config)
     print(f"[P5] Starting paper observation: {len(config.symbols)} symbols, "
           f"interval={args.interval}s, log={args.log}")
