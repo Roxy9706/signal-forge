@@ -537,6 +537,7 @@ class PaperObserver:
         self.scanner = PaperScanner(config)
         self.evaluator = PaperEvaluator(config)
         self.log_path = config.log_path
+        self.symbol_loss_cooldown = {}
 
         # Ensure log directory exists
         Path(self.log_path).parent.mkdir(parents=True, exist_ok=True)
@@ -735,6 +736,10 @@ class PaperObserver:
                 summary["data_quality_events"] += 1
                 continue
 
+            # Skip if on post-loss cooldown
+            if poll_ts < self.symbol_loss_cooldown.get(symbol, 0):
+                continue
+
             # Generate signals
             new_signals = self.scanner.generate_signals(
                 symbol=symbol,
@@ -768,6 +773,8 @@ class PaperObserver:
                     if not jsonl_has_outcome(self.log_path, outcome.signal_id):
                         jsonl_append(self.log_path, outcome.to_dict())
                         summary["outcomes_resolved"] += 1
+                        if getattr(outcome, "outcome", "") == "sl_hit":
+                            self.symbol_loss_cooldown[outcome.symbol] = outcome.outcome_time + (2 * 3600 * 1000)
 
         return summary
 
